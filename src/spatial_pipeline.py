@@ -21,6 +21,7 @@ __all__ = [
     "run_qc",
     "normalize",
     "select_hvgs",
+    "compute_clusters",
     "assign_injury_labels",
     "run_stabl_selection",
     "run_stabl_cached",
@@ -193,6 +194,29 @@ def _compute_pca_and_clusters(adata: ad.AnnData) -> ad.AnnData:
     sc.tl.umap(adata)
     sc.tl.leiden(adata, resolution=0.8, flavor="igraph", n_iterations=2, directed=False)
     print(f"  Leiden clustering: {adata.obs['leiden'].nunique()} clusters")
+    return adata
+
+
+def compute_clusters(
+    adata: ad.AnnData,
+    n_hvgs: int = DEFAULT_N_HVGS,
+) -> ad.AnnData:
+    """Add Leiden clusters to AnnData via HVG → PCA → neighbours → Leiden.
+
+    This is a convenience wrapper that selects HVGs, runs PCA +
+    Leiden on a copy, and transfers the ``leiden`` column back to
+    the original AnnData **in-place**.
+
+    Args:
+        adata: Normalized AnnData (full gene set).
+        n_hvgs: Number of HVGs for the clustering step.
+
+    Returns:
+        The same *adata* with a ``leiden`` column added to ``.obs``.
+    """
+    adata_hvg = select_hvgs(adata.copy(), n_top=n_hvgs)
+    adata_hvg = _compute_pca_and_clusters(adata_hvg)
+    adata.obs["leiden"] = adata_hvg.obs["leiden"]
     return adata
 
 

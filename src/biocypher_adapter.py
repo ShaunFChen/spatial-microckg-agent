@@ -25,6 +25,8 @@ __all__ = [
     "generate_gene_region_edges",
     "generate_cell_type_region_edges",
     "build_micro_ckg",
+    "save_graph",
+    "load_graph",
 ]
 
 # ---------------------------------------------------------------------------
@@ -346,3 +348,40 @@ def build_micro_ckg(
     print(f"  Micro-CKG: {n_nodes} nodes ({gene_nodes} genes, {ct_nodes} cell types, {region_nodes} regions)")
     print(f"  Micro-CKG: {n_edges} edges")
     return G
+
+
+def save_graph(graph: nx.DiGraph, path: Path | str) -> Path:
+    """Persist a Micro-CKG to disk as a GraphML file.
+
+    Args:
+        graph: The Micro-CKG as a NetworkX DiGraph.
+        path: Output file path (should end in ``.graphml``).
+
+    Returns:
+        The resolved output path.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nx.write_graphml(graph, str(path))
+    print(f"  Graph saved to {path}")
+    return path
+
+
+def load_graph(path: Path | str) -> nx.DiGraph:
+    """Load a Micro-CKG from a GraphML file.
+
+    Args:
+        path: Path to the ``.graphml`` file.
+
+    Returns:
+        The loaded NetworkX DiGraph.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Graph file not found: {path}")
+    graph = nx.read_graphml(str(path))
+    print(f"  Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
+    return graph

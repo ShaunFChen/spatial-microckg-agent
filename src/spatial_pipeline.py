@@ -24,8 +24,8 @@ __all__ = [
     "select_de_genes",
     "compute_clusters",
     "annotate_clusters",
-    "assign_injury_labels",
-    "downsample_per_sample",
+    "assign_condition_labels",
+    "stratified_downsample",
     "batch_correct",
     "run_stabl_selection",
     "run_stabl_cached",
@@ -40,7 +40,7 @@ DEFAULT_MIN_CELLS = 3
 DEFAULT_MAX_PCT_MT = 30.0
 DEFAULT_TARGET_SUM = 1e4
 DEFAULT_N_HVGS = 2000
-DEFAULT_N_BOOTSTRAPS = 250
+DEFAULT_N_BOOTSTRAPS = 200
 DEFAULT_SPOTS_PER_SAMPLE = 1000
 DEFAULT_FDR_ALPHA = 0.01
 DEFAULT_MIN_LOG2FC = 0.5
@@ -379,25 +379,30 @@ def annotate_clusters(
 # ---------------------------------------------------------------------------
 
 
-def downsample_per_sample(
+def stratified_downsample(
     adata: ad.AnnData,
     n_per_sample: int = DEFAULT_SPOTS_PER_SAMPLE,
     sample_key: str = "sample_id",
+    resolution: float = 0.5,
     random_state: int = 42,
 ) -> ad.AnnData:
-    """Randomly subsample spots per biological sample.
+    """Unsupervised Stratified Downsampling to objectively preserve spatial anatomical heterogeneity.
 
-    For each unique value in ``adata.obs[sample_key]``, retains at most
-    *n_per_sample* spots (or all spots if the sample has fewer).
+    Runs a rapid PCA + Leiden clustering on the merged AnnData, then
+    samples proportionally from each Leiden cluster within each
+    biological sample.  This prevents under-representation of
+    anatomically distinct regions (e.g. Hippocampus) that pure random
+    downsampling would risk eliminating.
 
     Args:
-        adata: AnnData with a sample identifier column in ``.obs``.
-        n_per_sample: Maximum spots to retain per sample.
+        adata: Normalized AnnData with a sample identifier column.
+        n_per_sample: Target number of spots per sample.
         sample_key: Column in ``.obs`` identifying biological samples.
+        resolution: Leiden clustering resolution for stratification.
         random_state: Seed for reproducibility.
 
     Returns:
-        A subsampled copy of the AnnData.
+        A stratified-downsampled copy of the AnnData.
 
     Raises:
         KeyError: If *sample_key* is not in ``adata.obs``.
@@ -406,17 +411,73 @@ def downsample_per_sample(
         raise KeyError(f"Column '{sample_key}' not found in adata.obs.")
 
     rng = np.random.default_rng(random_state)
+
+    # --- Rapid clustering for stratification ---
+    print("  Running PCA + Leiden for stratification...")
+    import warnings
+    adata_tmp = adata.copy()
+    sc.pp.highly_variable_genes(adata_tmp, n_top_genes=DEFAULT_N_HVGS)
+    adata_tmp = adata_tmp[:, adata_tmp.var["highly_variable"]].copy()
+    sc.pp.scale(adata_tmp, max_value=10)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="zero-centering a sparse")
+        sc.tl.pca(adata_tmp, svd_solver="arpack")
+    sc.pp.neighbors(adata_tmp, n_neighbors=10, n_pcs=40)
+    sc.tl.leiden(
+        adata_tmp, resolution=resolution,
+        flavor="igraph", n_iterations=2, directed=False,
+    )
+    adata.obs["_strat_leiden"] = adata_tmp.obs["leiden"].values
+    n_clusters = adata.obs["_strat_leiden"].nunique()
+    print(f"  Stratification clusters: {n_clusters}")
+
+    # --- Proportional sampling per (sample × cluster) ---
     indices: list[int] = []
     for sid in adata.obs[sample_key].unique():
-        mask = np.where(adata.obs[sample_key] == sid)[0]
-        n = min(n_per_sample, len(mask))
-        chosen = rng.choice(mask, size=n, replace=False)
-        indices.extend(chosen.tolist())
+        sample_mask = adata.obs[sample_key] == sid
+        sample_idx = np.where(sample_mask)[0]
+        n_sample = len(sample_idx)
+        n_target = min(n_per_sample, n_sample)
 
-    indices.sort()
+        clusters = adata.obs.loc[sample_mask, "_strat_leiden"]
+        cluster_counts = clusters.value_counts()
+
+        chosen: list[int] = []
+        for cid, count in cluster_counts.items():
+            proportion = count / n_sample
+            n_from_cluster = max(1, int(round(proportion * n_target)))
+            n_from_cluster = min(n_from_cluster, count)
+            cluster_idx = np.where(
+                sample_mask & (adata.obs["_strat_leiden"] == cid)
+            )[0]
+            picked = rng.choice(cluster_idx, size=n_from_cluster, replace=False)
+            chosen.extend(picked.tolist())
+
+        # Trim or pad to exact target
+        if len(chosen) > n_target:
+            chosen = rng.choice(chosen, size=n_target, replace=False).tolist()
+        elif len(chosen) < n_target:
+            remaining = list(set(sample_idx.tolist()) - set(chosen))
+            if remaining:
+                extra = rng.choice(
+                    remaining,
+                    size=min(n_target - len(chosen), len(remaining)),
+                    replace=False,
+                )
+                chosen.extend(extra.tolist())
+        indices.extend(chosen)
+
+    indices = sorted(set(indices))
     result = adata[indices].copy()
-    print(f"  Downsampled: {adata.n_obs} → {result.n_obs} spots "
-          f"(≤{n_per_sample} per sample)")
+
+    # Clean up temporary column
+    if "_strat_leiden" in result.obs.columns:
+        result.obs.drop(columns=["_strat_leiden"], inplace=True)
+    if "_strat_leiden" in adata.obs.columns:
+        adata.obs.drop(columns=["_strat_leiden"], inplace=True)
+
+    print(f"  Stratified downsample: {adata.n_obs} → {result.n_obs} spots "
+          f"(≤{n_per_sample} per sample, {n_clusters} strata)")
     return result
 
 
@@ -445,7 +506,22 @@ def batch_correct(
 
     n_batches = adata.obs[batch_key].nunique()
     print(f"  Applying ComBat batch correction ({n_batches} batches)...")
-    sc.pp.combat(adata, key=batch_key)
+
+    # Remove zero-variance genes that cause ComBat NaN warnings
+    import warnings
+    if hasattr(adata.X, "toarray"):
+        gene_var = np.asarray(adata.X.toarray().var(axis=0))
+    else:
+        gene_var = np.asarray(adata.X.var(axis=0)).ravel()
+    nonzero_mask = gene_var > 0
+    n_zero = int((~nonzero_mask).sum())
+    if n_zero > 0:
+        print(f"  Removed {n_zero} zero-variance genes before ComBat.")
+        adata = adata[:, nonzero_mask].copy()
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        sc.pp.combat(adata, key=batch_key)
     print("  ComBat correction applied.")
     return adata
 
@@ -455,7 +531,7 @@ def batch_correct(
 # ---------------------------------------------------------------------------
 
 
-def assign_injury_labels(
+def assign_condition_labels(
     adata: ad.AnnData,
     method: str = "cluster",
 ) -> np.ndarray:
@@ -464,7 +540,7 @@ def assign_injury_labels(
     Supports two strategies:
 
     - ``"condition"`` — reads the ground-truth experimental label
-      from ``adata.obs['condition']`` (0 = Sham, 1 = TBI).
+      from ``adata.obs['condition']`` (0 = WT, 1 = AD).
     - ``"cluster"`` — scores spots with a neuroinflammation gene
       signature and splits at the median score.
 
@@ -483,13 +559,13 @@ def assign_injury_labels(
     if method == "condition":
         if "condition" not in adata.obs.columns:
             raise KeyError(
-                "adata.obs['condition'] not found. Ensure the GEO TBI "
+                "adata.obs['condition'] not found. Ensure the GEO AD "
                 "dataset was loaded with condition labels."
             )
         y = adata.obs["condition"].astype(int).values
         counts = pd.Series(y).value_counts().sort_index()
         print(f"  Ground-truth condition labels: "
-              f"Sham(0)={counts.get(0, 0)}, TBI(1)={counts.get(1, 0)}")
+              f"WT(0)={counts.get(0, 0)}, AD(1)={counts.get(1, 0)}")
         return y
 
     if method != "cluster":
@@ -568,10 +644,11 @@ def run_stabl_selection(
         base_estimator=base_estimator,
         lambda_grid={"C": np.linspace(0.01, 1, 30)},
         n_bootstraps=n_bootstraps,
-        artificial_type="knockoff",
+        artificial_type="random_permutation",
         artificial_proportion=1.0,
         sample_fraction=0.5,
         random_state=42,
+        n_jobs=-1,
     )
 
     stabl.fit(X, y)
@@ -694,34 +771,31 @@ def run_stabl_cached(
     # --- Fresh computation ---
     print("  No cache found — computing from scratch.")
 
-    # 1) Optional per-sample downsampling and batch correction
+    # 1) Unsupervised Stratified Downsampling
     adata_work = adata.copy()
     if label_method == "condition":
         if "sample_id" in adata_work.obs.columns:
-            adata_work = downsample_per_sample(adata_work)
+            adata_work = stratified_downsample(adata_work)
 
-    # 2) Gene pre-filtering (BEFORE ComBat so condition signal is intact)
+    # 2) Gene pre-filtering (before ComBat)
     if prefilter == "de" and label_method == "condition":
         adata_sub = select_de_genes(
             adata_work, groupby="condition",
             fdr_alpha=fdr_alpha, min_log2fc=min_log2fc,
         )
     else:
-        # For HVG path, ComBat first, then HVG
-        if label_method == "condition" and "batch" in adata_work.obs.columns:
-            adata_work = batch_correct(adata_work)
         adata_sub = select_hvgs(adata_work, n_top=n_hvgs)
 
-    # 3) Apply ComBat on DE-selected genes (batch correct after subsetting)
-    if prefilter == "de" and "batch" in adata_sub.obs.columns:
-        adata_sub = batch_correct(adata_sub)
+    # 3) ComBat batch correction on the selected genes only
+    if "sample_id" in adata_sub.obs.columns:
+        adata_sub = batch_correct(adata_sub, batch_key="sample_id")
 
     # 4) Label assignment
     if label_method == "condition":
-        y = assign_injury_labels(adata_sub, method="condition")
+        y = assign_condition_labels(adata_sub, method="condition")
     else:
         adata_sub = _compute_pca_and_clusters(adata_sub)
-        y = assign_injury_labels(adata_sub, method=label_method)
+        y = assign_condition_labels(adata_sub, method=label_method)
 
     # 5) Prepare dense matrix for Stabl
     X = adata_sub.X
@@ -787,6 +861,12 @@ def _ensure_umap(adata: ad.AnnData) -> ad.AnnData:
     return adata
 
 
+# Anatomical verification markers to always include in plots
+_ANATOMICAL_MARKERS: list[str] = ["Prox1"]
+# AD inflammatory markers to prioritize in plots
+_AD_MARKERS: list[str] = ["Trem2", "Gfap"]
+
+
 def plot_spatial_markers(
     adata: ad.AnnData,
     markers: list[str],
@@ -795,10 +875,11 @@ def plot_spatial_markers(
 ) -> list[Path]:
     """Visualize marker gene expression with spatial or UMAP plots.
 
-    If the AnnData contains spatial coordinates and H&E images,
-    generates spatial overlay plots.  Otherwise falls back to UMAP
-    embedding colored by marker expression and, if available, the
-    ``condition`` label.
+    Always includes **Prox1** (Hippocampus Dentate Gyrus marker) and
+    AD inflammatory markers (Trem2, Gfap) alongside the top
+    Stabl-selected genes.  If the AnnData contains spatial coordinates
+    and H&E images, generates spatial overlay plots.  Otherwise falls
+    back to UMAP embedding.
 
     Args:
         adata: AnnData with expression data.
@@ -819,9 +900,15 @@ def plot_spatial_markers(
     # Use raw counts for expression overlay if available
     plot_adata = adata.raw.to_adata() if adata.raw is not None else adata
 
-    # Filter to markers present in the dataset
-    available = [m for m in markers[:n_top] if m in plot_adata.var_names]
-    if not available:
+    # Build gene list: top Stabl markers + Prox1 + AD markers (deduplicated)
+    gene_list: list[str] = []
+    seen: set[str] = set()
+    for g in list(markers[:n_top]) + _ANATOMICAL_MARKERS + _AD_MARKERS:
+        if g not in seen and g in plot_adata.var_names:
+            gene_list.append(g)
+            seen.add(g)
+
+    if not gene_list:
         print("  No requested markers found in dataset — skipping plots.")
         return []
 
@@ -831,7 +918,7 @@ def plot_spatial_markers(
         plot_adata = _ensure_umap(plot_adata)
 
     saved: list[Path] = []
-    for gene in available:
+    for gene in gene_list:
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         if use_spatial:
             sc.pl.spatial(
@@ -858,7 +945,7 @@ def plot_spatial_markers(
         saved.append(out_path)
         print(f"  Saved plot: {out_path}")
 
-    # Bonus: UMAP colored by condition label if available and using fallback
+    # Bonus: UMAP colored by condition label (WT vs AD)
     if not use_spatial and "condition" in plot_adata.obs.columns:
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         sc.pl.umap(
@@ -866,7 +953,7 @@ def plot_spatial_markers(
             color="condition",
             ax=ax,
             show=False,
-            title="Condition — UMAP",
+            title="Condition (WT vs AD) — UMAP",
             frameon=False,
         )
         out_path = save_dir / "umap_condition.png"

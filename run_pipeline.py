@@ -1,10 +1,10 @@
-"""End-to-end execution of the Spatial-MicroCKG TBI pipeline.
+"""End-to-end execution of the Spatial-MicroCKG Mouse AD pipeline.
 
 Orchestrates:
-1. GEO GSE319409 data download (3 TBI + 3 Sham, Vehicle-only)
-2. QC, normalization, downsampling, ComBat batch correction
+1. GEO GSE203424 data download (3 PSAPP×CO + 3 WT×CO, Corn-Oil only)
+2. QC, normalization, unsupervised stratified downsampling, ComBat batch correction
 3. Stabl stability-based feature selection (DE pre-filter → top markers)
-4. Spatial / UMAP marker visualization
+4. Spatial / UMAP marker visualization (including Prox1 verification)
 5. BioCypher Micro-CKG construction
 6. Local Ollama LLM agent query with evidence traceability
 """
@@ -26,17 +26,17 @@ for d in (DATA_DIR, CACHE_DIR, ASSETS_DIR):
 
 
 def main() -> None:
-    """Run the full Spatial-MicroCKG TBI pipeline."""
+    """Run the full Spatial-MicroCKG Mouse AD pipeline."""
     # ------------------------------------------------------------------
-    # 1. Data Ingestion — GEO GSE319409
+    # 1. Data Ingestion — GEO GSE203424
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 1: Data Ingestion — GEO GSE319409 (3 TBI + 3 Sham)")
+    print("STEP 1: Data Ingestion — GEO GSE203424 (3 PSAPP×CO + 3 WT×CO)")
     print("=" * 70)
 
     from src.data_ingestion import get_dataset
 
-    h5ad_path = get_dataset(DATA_DIR, source="geo_tbi")
+    h5ad_path = get_dataset(DATA_DIR, source="geo_ad")
 
     from src.spatial_pipeline import load_adata
 
@@ -58,10 +58,10 @@ def main() -> None:
     adata = normalize(adata)
 
     # ------------------------------------------------------------------
-    # 3. Stabl Feature Selection (with downsample + ComBat)
+    # 3. Stabl Feature Selection (stratified downsample → ComBat → DE)
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 3: Stabl Feature Selection (downsample → ComBat → DE pre-filter)")
+    print("STEP 3: Stabl Feature Selection (stratified downsample → ComBat → DE pre-filter)")
     print("=" * 70)
 
     from src.spatial_pipeline import run_stabl_cached
@@ -69,12 +69,11 @@ def main() -> None:
     stabl_result = run_stabl_cached(
         adata,
         cache_dir=CACHE_DIR,
-        dataset_name="geo_tbi",
+        dataset_name="geo_ad",
         label_method="condition",
-        n_bootstraps=500,
-        prefilter="de",
-        fdr_alpha=0.01,
-        min_log2fc=0.5,
+        n_bootstraps=200,
+        prefilter="hvg",
+        n_hvgs=2000,
     )
 
     print(f"\n  Stabl results:")
@@ -151,8 +150,8 @@ def main() -> None:
     print("  Agent initialized (Ollama — llama3.1:8b).\n")
 
     test_question = (
-        "What are the most significant genes associated with the TBI "
-        "condition in this Micro-CKG?"
+        "What are the most significant genes associated with the "
+        "Alzheimer's disease condition in this Micro-CKG?"
     )
     print(f"  Question: {test_question}\n")
 

@@ -22,6 +22,7 @@ __all__ = [
     "normalize",
     "select_hvgs",
     "compute_clusters",
+    "annotate_clusters",
     "assign_injury_labels",
     "run_stabl_selection",
     "run_stabl_cached",
@@ -51,6 +52,24 @@ CELL_TYPE_MARKERS: dict[str, str] = {
     "Syt1": "Neuron",
     "Cldn5": "Endothelial",
 }
+
+# Brain-region marker panels for spatial cluster annotation
+REGION_MARKER_PANELS: dict[str, list[str]] = {
+    "Cortex": ["Slc17a7", "Satb2", "Cux2", "Tbr1", "Foxp2"],
+    "Hippocampus": ["Prox1", "Fibcd1", "Dkk3", "C1ql2"],
+    "Thalamus": ["Gbx2", "Tcf7l2", "Prkcd"],
+    "Hypothalamus": ["Oxt", "Avp", "Agrp", "Pomc"],
+    "Striatum": ["Ppp1r1b", "Drd1", "Drd2", "Rarb"],
+    "White_Matter": ["Mbp", "Plp1", "Mag", "Mog"],
+    "Cerebellum": ["Pcp2", "Calb1", "Calb2"],
+    "Brainstem": ["Slc6a5", "Lhx3", "Chat"],
+}
+
+# Neuroinflammation signature genes for injury labelling
+NEUROINFLAMMATION_MARKERS: list[str] = [
+    "Gfap", "Aif1", "Cd68", "Tnf", "Il1b", "Cxcl10",
+    "C1qa", "C1qb", "C3", "Trem2", "Tyrobp", "Csf1r",
+]
 
 # Anatomical region mapping based on Leiden cluster characteristics
 REGION_LABELS: list[str] = [
@@ -220,6 +239,60 @@ def compute_clusters(
     return adata
 
 
+def annotate_clusters(
+    adata: ad.AnnData,
+) -> dict[str, str]:
+    """Assign brain-region labels to Leiden clusters via marker-gene scoring.
+
+    Scores each cluster against known brain-region marker panels using
+    ``sc.tl.score_genes``.  The region with the highest mean score in
+    a cluster wins.  If no panel scores significantly, the cluster is
+    labelled ``Unassigned``.
+
+    Args:
+        adata: AnnData with a ``leiden`` column and expression data.
+
+    Returns:
+        Dict mapping cluster id (str) to region label (str).
+    """
+    if "leiden" not in adata.obs.columns:
+        raise ValueError("Run compute_clusters() before annotate_clusters().")
+
+    src = adata.raw.to_adata() if adata.raw is not None else adata
+
+    # Score every panel
+    region_scores: dict[str, str] = {}
+    score_cols: list[str] = []
+    for region, markers in REGION_MARKER_PANELS.items():
+        available = [g for g in markers if g in src.var_names]
+        col = f"_score_{region}"
+        if len(available) >= 2:
+            sc.tl.score_genes(adata, gene_list=available, score_name=col)
+        else:
+            adata.obs[col] = 0.0
+        score_cols.append(col)
+
+    # For each cluster pick the region with the highest mean score
+    cluster_ids = sorted(adata.obs["leiden"].unique(), key=int)
+    for cid in cluster_ids:
+        mask = adata.obs["leiden"] == cid
+        best_region = "Unassigned"
+        best_val = 0.0
+        for region, col in zip(REGION_MARKER_PANELS, score_cols):
+            mean_score = float(adata.obs.loc[mask, col].mean())
+            if mean_score > best_val:
+                best_val = mean_score
+                best_region = region
+        region_scores[str(cid)] = best_region
+
+    # Clean up temporary columns
+    adata.obs.drop(columns=score_cols, inplace=True, errors="ignore")
+
+    summary = pd.Series(region_scores).value_counts()
+    print(f"  Cluster annotation: {dict(summary)}")
+    return region_scores
+
+
 # ---------------------------------------------------------------------------
 # Label Assignment (Supervised Target for Stabl)
 # ---------------------------------------------------------------------------
@@ -231,16 +304,15 @@ def assign_injury_labels(
 ) -> np.ndarray:
     """Assign binary labels for supervised Stabl feature selection.
 
-    For the squidpy Visium mouse brain dataset, Leiden clusters are
-    computed and then split into a binary target: clusters enriched in
-    cortical/hippocampal regions (label 1) versus subcortical regions
-    (label 0). This serves as a *methodological proxy* for injury-vs-
-    control contrasts and is documented as such.
+    Scores each spot with a neuroinflammation gene signature
+    (Gfap, Aif1/Iba1, Cd68, etc.) and splits at the median score.
+    Spots above the median are labelled 1 ("reactive"), below
+    are labelled 0 ("homeostatic").
 
     Args:
         adata: Normalized AnnData with spatial coordinates.
-        method: Labelling strategy — ``"cluster"`` uses Leiden-based
-            binary region split.
+        method: Labelling strategy — ``"cluster"`` uses
+            neuroinflammation-signature scoring.
 
     Returns:
         Binary numpy array of shape ``(n_obs,)`` with values 0 or 1.
@@ -251,17 +323,25 @@ def assign_injury_labels(
     if method != "cluster":
         raise ValueError(f"Unknown label method '{method}'. Use 'cluster'.")
 
-    if "leiden" not in adata.obs.columns:
-        adata = _compute_pca_and_clusters(adata)
+    src = adata.raw.to_adata() if adata.raw is not None else adata
+    available = [g for g in NEUROINFLAMMATION_MARKERS if g in src.var_names]
 
-    # Binary split: assign the larger half of clusters to label 0,
-    # the smaller half to label 1 (proxy for cortex vs. subcortical).
-    cluster_counts = adata.obs["leiden"].value_counts()
-    median_size = cluster_counts.median()
-    cortical_clusters = cluster_counts[cluster_counts >= median_size].index.tolist()
-
-    y = np.where(adata.obs["leiden"].isin(cortical_clusters), 1, 0)
-    print(f"  Binary label assignment: {y.sum()} label-1 / {(1 - y).sum()} label-0 spots")
+    if len(available) >= 3:
+        sc.tl.score_genes(adata, gene_list=available, score_name="neuroinflam_score")
+        median_score = float(adata.obs["neuroinflam_score"].median())
+        y = np.where(adata.obs["neuroinflam_score"] >= median_score, 1, 0)
+        print(f"  Neuroinflammation scoring ({len(available)} markers): "
+              f"{y.sum()} reactive / {(1 - y).sum()} homeostatic spots")
+    else:
+        # Fallback: Leiden-based split when signature genes are absent
+        if "leiden" not in adata.obs.columns:
+            adata = _compute_pca_and_clusters(adata)
+        cluster_counts = adata.obs["leiden"].value_counts()
+        median_size = cluster_counts.median()
+        large_clusters = cluster_counts[cluster_counts >= median_size].index.tolist()
+        y = np.where(adata.obs["leiden"].isin(large_clusters), 1, 0)
+        print(f"  Fallback label assignment (cluster-size split): "
+              f"{y.sum()} label-1 / {(1 - y).sum()} label-0 spots")
     return y
 
 

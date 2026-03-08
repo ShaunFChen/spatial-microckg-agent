@@ -7,4 +7,7 @@ __all__ = [
     "spatial_pipeline",
     "biocypher_adapter",
     "llm_agent",
+    "spatial_analytics",
+    "external_knowledge",
+    "graph_analytics",
 ]

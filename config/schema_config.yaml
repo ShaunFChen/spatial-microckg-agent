@@ -24,6 +24,42 @@ anatomical entity:
     name: str
     region_type: str
 
+biological process:
+  represented_as: node
+  preferred_id: name
+  input_label: biological_process
+  properties:
+    name: str
+    source_library: str
+    adjusted_pvalue: float
+    combined_score: float
+
+drug:
+  represented_as: node
+  preferred_id: name
+  input_label: drug
+  properties:
+    name: str
+    max_phase: int
+
+disease:
+  represented_as: node
+  preferred_id: name
+  input_label: disease
+  properties:
+    name: str
+    disease_id: str
+
+protein:
+  represented_as: node
+  preferred_id: symbol
+  input_label: protein
+  properties:
+    symbol: str
+    species: str
+
+# --- Edges ---
+
 gene to cell type association:
   is_a: association
   represented_as: edge
@@ -33,6 +69,8 @@ gene to cell type association:
   properties:
     stability_score: float
     mean_expression: float
+    log2fc: float
+    pval_adj: float
 
 gene to anatomical entity association:
   is_a: association
@@ -51,3 +89,62 @@ cell type to anatomical entity association:
   target: anatomical entity
   properties:
     enrichment_score: float
+
+ligand receptor interaction:
+  is_a: association
+  represented_as: edge
+  input_label: ligand_receptor_interaction
+  source: cell type
+  target: cell type
+  properties:
+    ligand: str
+    receptor: str
+    mean_expression: float
+    pvalue: float
+
+spatial proximity:
+  is_a: association
+  represented_as: edge
+  input_label: spatial_proximity
+  source: cell type
+  target: cell type
+  properties:
+    zscore: float
+    direction: str
+
+protein protein interaction:
+  is_a: association
+  represented_as: edge
+  input_label: protein_protein_interaction
+  source: protein
+  target: protein
+  properties:
+    score: float
+
+gene to biological process association:
+  is_a: association
+  represented_as: edge
+  input_label: gene_process_association
+  source: gene
+  target: biological process
+  properties:
+    source_library: str
+
+gene to drug association:
+  is_a: association
+  represented_as: edge
+  input_label: drug_target_association
+  source: drug
+  target: gene
+  properties:
+    mechanism_of_action: str
+    max_phase: int
+
+gene to disease association:
+  is_a: association
+  represented_as: edge
+  input_label: gene_disease_association
+  source: gene
+  target: disease
+  properties:
+    disease_id: str

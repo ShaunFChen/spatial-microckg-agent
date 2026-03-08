@@ -25,6 +25,10 @@ dependencies = [
     "stabl @ git+https://github.com/gregbellan/Stabl.git@v1.0.1-lw",
     "igraph>=1.0.0",
     "leidenalg>=0.11.0",
+    "langchain-ollama",
+    "mygene",
+    "gseapy",
+    "chembl-webresource-client",
 ]
 
 [dependency-groups]

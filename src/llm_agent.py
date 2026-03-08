@@ -9,6 +9,7 @@ paths. Speculation beyond graph contents is prohibited.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import networkx as nx
@@ -25,7 +26,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_SUPPORTED_PROVIDERS = ("google", "openai")
+_SUPPORTED_PROVIDERS = ("google", "openai", "ollama")
+_DEFAULT_MAX_RETRIES = 5
+_DEFAULT_INITIAL_DELAY = 30.0
 
 _SYSTEM_PROMPT = """\
 You are a precise biomedical knowledge-graph analyst. You answer questions
@@ -82,9 +85,11 @@ def get_llm(
     Loads API keys from environment variables (via ``.env`` file).
 
     Args:
-        provider: LLM provider — ``"google"`` (default) or ``"openai"``.
+        provider: LLM provider — ``"google"`` (default), ``"openai"``,
+            or ``"ollama"`` (local, no API key needed).
         model: Model name override. Defaults to ``gemini-2.0-flash``
-            for Google and ``gpt-4o-mini`` for OpenAI.
+            for Google, ``gpt-4o-mini`` for OpenAI, and
+            ``llama3.1:8b`` for Ollama.
         temperature: Sampling temperature (0.0 = deterministic).
 
     Returns:
@@ -121,6 +126,14 @@ def get_llm(
         return ChatOpenAI(
             model=model or "gpt-4o-mini",
             api_key=api_key,
+            temperature=temperature,
+        )
+
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=model or "llama3.1:8b",
             temperature=temperature,
         )
 
@@ -220,18 +233,46 @@ def create_qa_agent(
 def query_graph(
     agent: Any,
     question: str,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    initial_delay: float = _DEFAULT_INITIAL_DELAY,
 ) -> str:
-    """Submit a question to the evidence-traced QA agent.
+    """Submit a question to the evidence-traced QA agent with retry.
+
+    Retries with exponential backoff on rate-limit (429) errors.
+    The delay doubles after each failed attempt, starting from
+    *initial_delay* seconds.
 
     Args:
         agent: The LangChain ``RunnableSequence`` from
             :func:`create_qa_agent`.
         question: Natural-language question about the Micro-CKG.
+        max_retries: Maximum number of retry attempts on rate-limit
+            errors.
+        initial_delay: Initial wait time in seconds before the first
+            retry (doubles each attempt).
 
     Returns:
         The LLM's answer including ``(Source)--[Edge, Score=X.XX]-->
         (Target)`` evidence citations.
+
+    Raises:
+        RuntimeError: If all retry attempts are exhausted.
     """
     print(f"  Querying agent: {question[:80]}...")
-    answer = agent.invoke({"question": question})
-    return answer
+    delay = initial_delay
+
+    for attempt in range(max_retries + 1):
+        try:
+            answer = agent.invoke({"question": question})
+            return answer
+        except Exception as exc:  # noqa: BLE001
+            err_str = str(exc).lower()
+            is_rate_limit = "429" in err_str or "resource_exhausted" in err_str or "too many requests" in err_str
+            if not is_rate_limit or attempt == max_retries:
+                raise
+            print(f"  Rate-limited (attempt {attempt + 1}/{max_retries + 1}). "
+                  f"Retrying in {delay:.0f}s...")
+            time.sleep(delay)
+            delay *= 2
+
+    raise RuntimeError("query_graph: all retry attempts exhausted")

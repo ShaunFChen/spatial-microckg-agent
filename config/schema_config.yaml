@@ -1,0 +1,53 @@
+gene:
+  represented_as: node
+  preferred_id: symbol
+  input_label: gene
+  properties:
+    symbol: str
+    stability_score: float
+    is_selected: bool
+
+cell type:
+  represented_as: node
+  preferred_id: name
+  input_label: cell_type
+  properties:
+    name: str
+    cluster_id: int
+    cell_count: int
+
+anatomical entity:
+  represented_as: node
+  preferred_id: name
+  input_label: anatomical_entity
+  properties:
+    name: str
+    region_type: str
+
+gene to cell type association:
+  is_a: association
+  represented_as: edge
+  input_label: gene_cell_type_association
+  source: gene
+  target: cell type
+  properties:
+    stability_score: float
+    mean_expression: float
+
+gene to anatomical entity association:
+  is_a: association
+  represented_as: edge
+  input_label: gene_anatomical_entity_association
+  source: gene
+  target: anatomical entity
+  properties:
+    spatial_correlation: float
+
+cell type to anatomical entity association:
+  is_a: association
+  represented_as: edge
+  input_label: cell_type_anatomical_entity_association
+  source: cell type
+  target: anatomical entity
+  properties:
+    enrichment_score: float

@@ -1,0 +1,31 @@
+# Environment
+.env
+.venv/
+
+# Data & cache (large files)
+data/
+cache/
+assets/*.png
+*.pkl
+*.h5ad
+*.h5
+*.loom
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

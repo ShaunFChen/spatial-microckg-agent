@@ -21,9 +21,12 @@ __all__ = [
     "run_qc",
     "normalize",
     "select_hvgs",
+    "select_de_genes",
     "compute_clusters",
     "annotate_clusters",
     "assign_injury_labels",
+    "downsample_per_sample",
+    "batch_correct",
     "run_stabl_selection",
     "run_stabl_cached",
     "plot_spatial_markers",
@@ -37,7 +40,10 @@ DEFAULT_MIN_CELLS = 3
 DEFAULT_MAX_PCT_MT = 30.0
 DEFAULT_TARGET_SUM = 1e4
 DEFAULT_N_HVGS = 2000
-DEFAULT_N_BOOTSTRAPS = 500
+DEFAULT_N_BOOTSTRAPS = 250
+DEFAULT_SPOTS_PER_SAMPLE = 1000
+DEFAULT_FDR_ALPHA = 0.01
+DEFAULT_MIN_LOG2FC = 0.5
 
 # Marker-to-cell-type mapping for annotation (mouse brain)
 CELL_TYPE_MARKERS: dict[str, str] = {
@@ -198,6 +204,81 @@ def select_hvgs(
     return adata
 
 
+def select_de_genes(
+    adata: ad.AnnData,
+    groupby: str = "condition",
+    fdr_alpha: float = DEFAULT_FDR_ALPHA,
+    min_log2fc: float = DEFAULT_MIN_LOG2FC,
+) -> ad.AnnData:
+    """Pre-filter genes by t-test differential expression with FDR correction.
+
+    Runs a Welch t-test between groups defined by *groupby*, applies
+    Benjamini-Hochberg FDR correction, and retains genes that pass both
+    the adjusted p-value and fold-change thresholds.  This produces a
+    biologically focused gene set for downstream Stabl selection.
+
+    Args:
+        adata: Normalized AnnData object.
+        groupby: Column in ``adata.obs`` defining the two groups
+            (e.g. ``"condition"`` with values 0/1).
+        fdr_alpha: Maximum BH-adjusted p-value to retain a gene.
+        min_log2fc: Minimum absolute log2 fold-change.
+
+    Returns:
+        AnnData subsetted to DE-significant genes.
+
+    Raises:
+        KeyError: If *groupby* is not in ``adata.obs``.
+        ValueError: If fewer than 2 groups exist in *groupby*.
+    """
+    if groupby not in adata.obs.columns:
+        raise KeyError(f"Column '{groupby}' not found in adata.obs.")
+
+    groups = adata.obs[groupby].unique()
+    if len(groups) < 2:
+        raise ValueError(
+            f"Need ≥2 groups in '{groupby}', found {len(groups)}."
+        )
+
+    # Ensure groupby column is categorical (required by scanpy)
+    if not hasattr(adata.obs[groupby].dtype, "categories"):
+        adata.obs[groupby] = adata.obs[groupby].astype("category")
+
+    # Run t-test (Welch, unequal variance) with BH correction
+    sc.tl.rank_genes_groups(
+        adata,
+        groupby=groupby,
+        method="t-test",
+        use_raw=False,
+        key_added="_de_prefilter",
+    )
+
+    # Collect results for all groups and take the union of significant genes
+    sig_genes: set[str] = set()
+    for grp in groups:
+        df = sc.get.rank_genes_groups_df(
+            adata, group=str(grp), key="_de_prefilter"
+        )
+        mask = (
+            (df["pvals_adj"] < fdr_alpha)
+            & (df["logfoldchanges"].abs() > min_log2fc)
+        )
+        sig_genes.update(df.loc[mask, "names"].tolist())
+
+    # Clean up temporary key
+    del adata.uns["_de_prefilter"]
+
+    sig_genes_sorted = [g for g in adata.var_names if g in sig_genes]
+    adata_de = adata[:, sig_genes_sorted].copy()
+
+    print(
+        f"  DE pre-filter ({groupby}, t-test): "
+        f"{adata.n_vars} → {adata_de.n_vars} genes "
+        f"(FDR < {fdr_alpha}, |log2FC| > {min_log2fc})"
+    )
+    return adata_de
+
+
 def _compute_pca_and_clusters(adata: ad.AnnData) -> ad.AnnData:
     """Run PCA, neighbours, UMAP, and Leiden clustering.
 
@@ -294,6 +375,82 @@ def annotate_clusters(
 
 
 # ---------------------------------------------------------------------------
+# Downsampling & Batch Correction
+# ---------------------------------------------------------------------------
+
+
+def downsample_per_sample(
+    adata: ad.AnnData,
+    n_per_sample: int = DEFAULT_SPOTS_PER_SAMPLE,
+    sample_key: str = "sample_id",
+    random_state: int = 42,
+) -> ad.AnnData:
+    """Randomly subsample spots per biological sample.
+
+    For each unique value in ``adata.obs[sample_key]``, retains at most
+    *n_per_sample* spots (or all spots if the sample has fewer).
+
+    Args:
+        adata: AnnData with a sample identifier column in ``.obs``.
+        n_per_sample: Maximum spots to retain per sample.
+        sample_key: Column in ``.obs`` identifying biological samples.
+        random_state: Seed for reproducibility.
+
+    Returns:
+        A subsampled copy of the AnnData.
+
+    Raises:
+        KeyError: If *sample_key* is not in ``adata.obs``.
+    """
+    if sample_key not in adata.obs.columns:
+        raise KeyError(f"Column '{sample_key}' not found in adata.obs.")
+
+    rng = np.random.default_rng(random_state)
+    indices: list[int] = []
+    for sid in adata.obs[sample_key].unique():
+        mask = np.where(adata.obs[sample_key] == sid)[0]
+        n = min(n_per_sample, len(mask))
+        chosen = rng.choice(mask, size=n, replace=False)
+        indices.extend(chosen.tolist())
+
+    indices.sort()
+    result = adata[indices].copy()
+    print(f"  Downsampled: {adata.n_obs} → {result.n_obs} spots "
+          f"(≤{n_per_sample} per sample)")
+    return result
+
+
+def batch_correct(
+    adata: ad.AnnData,
+    batch_key: str = "batch",
+) -> ad.AnnData:
+    """Apply ComBat batch correction to log-normalized expression.
+
+    Uses ``scanpy.pp.combat`` to regress out technical batch variance
+    between tissue slices. Must be called on log-normalized data
+    **before** HVG selection.
+
+    Args:
+        adata: Log-normalized AnnData with a batch column in ``.obs``.
+        batch_key: Column in ``.obs`` identifying batches.
+
+    Returns:
+        Batch-corrected AnnData (modified in-place and returned).
+
+    Raises:
+        KeyError: If *batch_key* is not in ``adata.obs``.
+    """
+    if batch_key not in adata.obs.columns:
+        raise KeyError(f"Column '{batch_key}' not found in adata.obs.")
+
+    n_batches = adata.obs[batch_key].nunique()
+    print(f"  Applying ComBat batch correction ({n_batches} batches)...")
+    sc.pp.combat(adata, key=batch_key)
+    print("  ComBat correction applied.")
+    return adata
+
+
+# ---------------------------------------------------------------------------
 # Label Assignment (Supervised Target for Stabl)
 # ---------------------------------------------------------------------------
 
@@ -304,24 +461,41 @@ def assign_injury_labels(
 ) -> np.ndarray:
     """Assign binary labels for supervised Stabl feature selection.
 
-    Scores each spot with a neuroinflammation gene signature
-    (Gfap, Aif1/Iba1, Cd68, etc.) and splits at the median score.
-    Spots above the median are labelled 1 ("reactive"), below
-    are labelled 0 ("homeostatic").
+    Supports two strategies:
+
+    - ``"condition"`` — reads the ground-truth experimental label
+      from ``adata.obs['condition']`` (0 = Sham, 1 = TBI).
+    - ``"cluster"`` — scores spots with a neuroinflammation gene
+      signature and splits at the median score.
 
     Args:
-        adata: Normalized AnnData with spatial coordinates.
-        method: Labelling strategy — ``"cluster"`` uses
-            neuroinflammation-signature scoring.
+        adata: Normalized AnnData.
+        method: Labelling strategy — ``"condition"`` for ground-truth
+            experimental labels, ``"cluster"`` for proxy scoring.
 
     Returns:
         Binary numpy array of shape ``(n_obs,)`` with values 0 or 1.
 
     Raises:
         ValueError: If *method* is not recognised.
+        KeyError: If ``method="condition"`` but the column is absent.
     """
+    if method == "condition":
+        if "condition" not in adata.obs.columns:
+            raise KeyError(
+                "adata.obs['condition'] not found. Ensure the GEO TBI "
+                "dataset was loaded with condition labels."
+            )
+        y = adata.obs["condition"].astype(int).values
+        counts = pd.Series(y).value_counts().sort_index()
+        print(f"  Ground-truth condition labels: "
+              f"Sham(0)={counts.get(0, 0)}, TBI(1)={counts.get(1, 0)}")
+        return y
+
     if method != "cluster":
-        raise ValueError(f"Unknown label method '{method}'. Use 'cluster'.")
+        raise ValueError(
+            f"Unknown label method '{method}'. Use 'condition' or 'cluster'."
+        )
 
     src = adata.raw.to_adata() if adata.raw is not None else adata
     available = [g for g in NEUROINFLAMMATION_MARKERS if g in src.var_names]
@@ -394,7 +568,7 @@ def run_stabl_selection(
         base_estimator=base_estimator,
         lambda_grid={"C": np.linspace(0.01, 1, 30)},
         n_bootstraps=n_bootstraps,
-        artificial_type="random_permutation",
+        artificial_type="knockoff",
         artificial_proportion=1.0,
         sample_fraction=0.5,
         random_state=42,
@@ -435,18 +609,31 @@ def run_stabl_selection(
 # Caching
 # ---------------------------------------------------------------------------
 
-def _cache_key(dataset_name: str, n_hvgs: int, label_method: str) -> str:
+def _cache_key(
+    dataset_name: str,
+    label_method: str,
+    prefilter: str = "hvg",
+    n_hvgs: int = DEFAULT_N_HVGS,
+    fdr_alpha: float = DEFAULT_FDR_ALPHA,
+    min_log2fc: float = DEFAULT_MIN_LOG2FC,
+) -> str:
     """Compute a deterministic cache key string.
 
     Args:
         dataset_name: Identifier for the dataset (e.g. ``"squidpy"``).
-        n_hvgs: Number of HVGs used.
         label_method: Label assignment method.
+        prefilter: Pre-filter strategy — ``"de"`` or ``"hvg"``.
+        n_hvgs: Number of HVGs (used when ``prefilter="hvg"``).
+        fdr_alpha: FDR threshold (used when ``prefilter="de"``).
+        min_log2fc: Min |log2FC| (used when ``prefilter="de"``).
 
     Returns:
         A hex digest string.
     """
-    raw = f"{dataset_name}_{n_hvgs}_{label_method}"
+    if prefilter == "de":
+        raw = f"{dataset_name}_de{fdr_alpha}_fc{min_log2fc}_{label_method}"
+    else:
+        raw = f"{dataset_name}_{n_hvgs}_{label_method}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -457,6 +644,9 @@ def run_stabl_cached(
     n_hvgs: int = DEFAULT_N_HVGS,
     label_method: str = "cluster",
     n_bootstraps: int = DEFAULT_N_BOOTSTRAPS,
+    prefilter: str = "hvg",
+    fdr_alpha: float = DEFAULT_FDR_ALPHA,
+    min_log2fc: float = DEFAULT_MIN_LOG2FC,
 ) -> dict[str, Any]:
     """Run Stabl with disk caching of results.
 
@@ -464,13 +654,23 @@ def run_stabl_cached(
     directly (completing in under one second). Otherwise runs the full
     Stabl computation and persists the results.
 
+    Two pre-filter strategies are supported:
+
+    - ``"de"`` — t-test differential expression with BH FDR correction
+      (recommended when ground-truth condition labels are available).
+    - ``"hvg"`` — top-N highly variable genes (original behaviour).
+
     Args:
-        adata: Normalized AnnData (not yet HVG-subsetted).
+        adata: Normalized AnnData (not yet subsetted).
         cache_dir: Directory for cache files.
         dataset_name: Identifier for cache key computation.
-        n_hvgs: Number of HVGs to select before Stabl.
+        n_hvgs: Number of HVGs (used when ``prefilter="hvg"``).
         label_method: Label assignment strategy.
         n_bootstraps: Number of Stabl bootstrap iterations.
+        prefilter: Gene pre-filter — ``"de"`` for t-test DE or
+            ``"hvg"`` for highly variable genes.
+        fdr_alpha: FDR threshold for DE pre-filter (default 0.01).
+        min_log2fc: Minimum |log2FC| for DE pre-filter (default 0.5).
 
     Returns:
         Stabl result dictionary (see :func:`run_stabl_selection`).
@@ -478,7 +678,11 @@ def run_stabl_cached(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    key = _cache_key(dataset_name, n_hvgs, label_method)
+    key = _cache_key(
+        dataset_name, label_method,
+        prefilter=prefilter, n_hvgs=n_hvgs,
+        fdr_alpha=fdr_alpha, min_log2fc=min_log2fc,
+    )
     pkl_path = cache_dir / f"stabl_results_{key}.pkl"
     csv_path = cache_dir / f"stabl_features_{key}.csv"
 
@@ -490,24 +694,46 @@ def run_stabl_cached(
     # --- Fresh computation ---
     print("  No cache found — computing from scratch.")
 
-    # 1) HVG selection
-    adata_hvg = select_hvgs(adata.copy(), n_top=n_hvgs)
+    # 1) Optional per-sample downsampling and batch correction
+    adata_work = adata.copy()
+    if label_method == "condition":
+        if "sample_id" in adata_work.obs.columns:
+            adata_work = downsample_per_sample(adata_work)
 
-    # 2) Clustering & label assignment
-    adata_hvg = _compute_pca_and_clusters(adata_hvg)
-    y = assign_injury_labels(adata_hvg, method=label_method)
+    # 2) Gene pre-filtering (BEFORE ComBat so condition signal is intact)
+    if prefilter == "de" and label_method == "condition":
+        adata_sub = select_de_genes(
+            adata_work, groupby="condition",
+            fdr_alpha=fdr_alpha, min_log2fc=min_log2fc,
+        )
+    else:
+        # For HVG path, ComBat first, then HVG
+        if label_method == "condition" and "batch" in adata_work.obs.columns:
+            adata_work = batch_correct(adata_work)
+        adata_sub = select_hvgs(adata_work, n_top=n_hvgs)
 
-    # 3) Prepare dense matrix for Stabl
-    X = adata_hvg.X
+    # 3) Apply ComBat on DE-selected genes (batch correct after subsetting)
+    if prefilter == "de" and "batch" in adata_sub.obs.columns:
+        adata_sub = batch_correct(adata_sub)
+
+    # 4) Label assignment
+    if label_method == "condition":
+        y = assign_injury_labels(adata_sub, method="condition")
+    else:
+        adata_sub = _compute_pca_and_clusters(adata_sub)
+        y = assign_injury_labels(adata_sub, method=label_method)
+
+    # 5) Prepare dense matrix for Stabl
+    X = adata_sub.X
     if hasattr(X, "toarray"):
         X = X.toarray()
     X = np.asarray(X, dtype=np.float64)
-    feature_names = list(adata_hvg.var_names)
+    feature_names = list(adata_sub.var_names)
 
-    # 4) Run Stabl
+    # 6) Run Stabl
     result = run_stabl_selection(X, y, feature_names, n_bootstraps=n_bootstraps)
 
-    # 5) Persist cache
+    # 7) Persist cache
     with open(pkl_path, "wb") as f:
         pickle.dump(result, f)
 
@@ -526,20 +752,56 @@ def run_stabl_cached(
 # ---------------------------------------------------------------------------
 
 
+def _has_spatial(adata: ad.AnnData) -> bool:
+    """Check whether AnnData has spatial coordinates and images.
+
+    Args:
+        adata: AnnData to inspect.
+
+    Returns:
+        ``True`` if both ``obsm['spatial']`` and ``uns['spatial']`` exist.
+    """
+    return (
+        adata.obsm.get("spatial") is not None
+        and adata.uns.get("spatial") is not None
+    )
+
+
+def _ensure_umap(adata: ad.AnnData) -> ad.AnnData:
+    """Compute PCA, neighbours, and UMAP if not already present.
+
+    Args:
+        adata: AnnData (normalized, optionally HVG-subsetted).
+
+    Returns:
+        The same AnnData with ``X_umap`` in ``.obsm``.
+    """
+    if "X_umap" not in adata.obsm:
+        print("  Computing UMAP embedding for fallback visualization...")
+        if "X_pca" not in adata.obsm:
+            sc.pp.scale(adata, max_value=10)
+            sc.tl.pca(adata, svd_solver="arpack")
+        if "neighbors" not in adata.uns:
+            sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+        sc.tl.umap(adata)
+    return adata
+
+
 def plot_spatial_markers(
     adata: ad.AnnData,
     markers: list[str],
     save_dir: Path | str,
     n_top: int = 5,
 ) -> list[Path]:
-    """Overlay marker gene expression on the H&E tissue image.
+    """Visualize marker gene expression with spatial or UMAP plots.
 
-    Generates one spatial plot per marker gene and saves each as a
-    high-resolution PNG file.
+    If the AnnData contains spatial coordinates and H&E images,
+    generates spatial overlay plots.  Otherwise falls back to UMAP
+    embedding colored by marker expression and, if available, the
+    ``condition`` label.
 
     Args:
-        adata: AnnData with spatial coordinates in
-            ``obsm['spatial']`` and an H&E image in ``uns['spatial']``.
+        adata: AnnData with expression data.
         markers: Candidate marker genes sorted by stability score.
         save_dir: Directory to write PNG files.
         n_top: Maximum number of markers to plot.
@@ -560,24 +822,57 @@ def plot_spatial_markers(
     # Filter to markers present in the dataset
     available = [m for m in markers[:n_top] if m in plot_adata.var_names]
     if not available:
-        print("  No requested markers found in dataset — skipping spatial plots.")
+        print("  No requested markers found in dataset — skipping plots.")
         return []
+
+    use_spatial = _has_spatial(plot_adata)
+    if not use_spatial:
+        print("  Spatial coordinates not available — using UMAP fallback.")
+        plot_adata = _ensure_umap(plot_adata)
 
     saved: list[Path] = []
     for gene in available:
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        sc.pl.spatial(
-            plot_adata,
-            color=gene,
-            ax=ax,
-            show=False,
-            title=f"{gene} — Spatial Expression",
-            frameon=False,
-        )
-        out_path = save_dir / f"spatial_{gene}.png"
+        if use_spatial:
+            sc.pl.spatial(
+                plot_adata,
+                color=gene,
+                ax=ax,
+                show=False,
+                title=f"{gene} — Spatial Expression",
+                frameon=False,
+            )
+            out_path = save_dir / f"spatial_{gene}.png"
+        else:
+            sc.pl.umap(
+                plot_adata,
+                color=gene,
+                ax=ax,
+                show=False,
+                title=f"{gene} — UMAP Expression",
+                frameon=False,
+            )
+            out_path = save_dir / f"umap_{gene}.png"
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         saved.append(out_path)
-        print(f"  Saved spatial plot: {out_path}")
+        print(f"  Saved plot: {out_path}")
+
+    # Bonus: UMAP colored by condition label if available and using fallback
+    if not use_spatial and "condition" in plot_adata.obs.columns:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        sc.pl.umap(
+            plot_adata,
+            color="condition",
+            ax=ax,
+            show=False,
+            title="Condition — UMAP",
+            frameon=False,
+        )
+        out_path = save_dir / "umap_condition.png"
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(out_path)
+        print(f"  Saved plot: {out_path}")
 
     return saved

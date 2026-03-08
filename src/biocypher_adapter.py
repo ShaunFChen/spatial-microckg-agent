@@ -36,6 +36,63 @@ __all__ = [
 # ---------------------------------------------------------------------------
 _DE_PVAL_THRESHOLD = 0.05
 _DE_LOG2FC_THRESHOLD = 0.5
+_DEFAULT_MIN_GENES = 20
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _expand_gene_list(
+    stabl_result: dict[str, Any],
+    min_genes: int = _DEFAULT_MIN_GENES,
+) -> dict[str, Any]:
+    """Expand Stabl results to include at least *min_genes* genes.
+
+    When Stabl selects fewer than *min_genes*, the top-ranked genes by
+    stability score are added (marked ``is_selected=False``).
+
+    Args:
+        stabl_result: Dictionary from :func:`run_stabl_cached`.
+        min_genes: Minimum number of genes to include.
+
+    Returns:
+        A shallow copy of *stabl_result* with expanded
+        ``selected_genes`` and ``stability_scores``.
+    """
+    selected = list(stabl_result["selected_genes"])
+    scores = dict(stabl_result["stability_scores"])
+
+    if len(selected) >= min_genes:
+        return stabl_result
+
+    all_scores = stabl_result.get("all_scores")
+    all_names = stabl_result.get("all_feature_names")
+    if all_scores is None or all_names is None:
+        return stabl_result
+
+    # Rank all features by stability score, descending
+    ranked = sorted(
+        zip(all_names, all_scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    selected_set = set(selected)
+    for name, score in ranked:
+        if len(selected) >= min_genes:
+            break
+        if name not in selected_set:
+            selected.append(name)
+            selected_set.add(name)
+            scores[name] = float(score)
+
+    expanded = dict(stabl_result)
+    expanded["selected_genes"] = selected
+    expanded["stability_scores"] = scores
+    expanded["n_selected_original"] = stabl_result["n_selected"]
+    expanded["n_selected"] = len(selected)
+    return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -48,13 +105,19 @@ def generate_gene_nodes(
 ) -> Iterator[tuple[str, str, dict[str, Any]]]:
     """Yield BioCypher node tuples for Stabl-selected genes.
 
+    Genes from the original FDP+ selection are marked
+    ``is_selected=True``; genes added via the *min_genes* expansion
+    are marked ``is_selected=False``.
+
     Args:
-        stabl_result: Dictionary returned by ``run_stabl_selection``.
+        stabl_result: Dictionary returned by ``run_stabl_selection``
+            (or expanded by :func:`_expand_gene_list`).
 
     Yields:
-        Tuples of ``(node_id, node_label, properties)`` for each selected gene.
+        Tuples of ``(node_id, node_label, properties)`` for each gene.
     """
-    for gene in stabl_result["selected_genes"]:
+    n_orig = stabl_result.get("n_selected_original", len(stabl_result["selected_genes"]))
+    for idx, gene in enumerate(stabl_result["selected_genes"]):
         score = stabl_result["stability_scores"][gene]
         yield (
             f"gene:{gene}",
@@ -62,7 +125,7 @@ def generate_gene_nodes(
             {
                 "symbol": gene,
                 "stability_score": round(score, 4),
-                "is_selected": True,
+                "is_selected": idx < n_orig,
             },
         )
 
@@ -332,6 +395,7 @@ def build_micro_ckg(
     adata: ad.AnnData,
     schema_path: Path | str | None = None,
     cluster_annotation: dict[str, str] | None = None,
+    min_genes: int = _DEFAULT_MIN_GENES,
 ) -> nx.DiGraph:
     """Construct a BioCypher-backed Micro-CKG as a NetworkX DiGraph.
 
@@ -339,19 +403,32 @@ def build_micro_ckg(
     results to create statistically-filtered edges (adj. p < 0.05,
     |log2FC| > 0.5).
 
+    When Stabl selects fewer than *min_genes*, the top-ranked genes by
+    stability score are included to ensure the graph is informative.
+
     Args:
         stabl_result: Dictionary from :func:`run_stabl_cached`.
         adata: AnnData with ``leiden`` clusters and raw expression.
         schema_path: Path to the BioCypher ``schema_config.yaml``.
         cluster_annotation: Dict mapping cluster id to region label
             (from :func:`annotate_clusters`).
+        min_genes: Minimum number of gene nodes (default 20).
 
     Returns:
         A NetworkX directed graph with Gene, CellType, and
         AnatomicalEntity nodes plus DE-filtered association edges.
     """
+    # Expand gene list if fewer than min_genes were selected
+    expanded = _expand_gene_list(stabl_result, min_genes=min_genes)
+    n_orig = expanded.get("n_selected_original", len(expanded["selected_genes"]))
+    if len(expanded["selected_genes"]) > n_orig:
+        print(
+            f"  Expanded gene list: {n_orig} Stabl-selected → "
+            f"{len(expanded['selected_genes'])} genes (min_genes={min_genes})"
+        )
+
     print("  Running DE testing (Wilcoxon rank-sum)...")
-    de_df = _run_de_analysis(adata, stabl_result["selected_genes"])
+    de_df = _run_de_analysis(adata, expanded["selected_genes"])
     sig = de_df[
         (de_df["pval_adj"] < _DE_PVAL_THRESHOLD)
         & (de_df["log2fc"].abs() >= _DE_LOG2FC_THRESHOLD)
@@ -362,7 +439,7 @@ def build_micro_ckg(
     G = nx.DiGraph()
 
     # Add nodes
-    for node_id, node_label, props in generate_gene_nodes(stabl_result):
+    for node_id, node_label, props in generate_gene_nodes(expanded):
         G.add_node(node_id, label=node_label, **props)
 
     for node_id, node_label, props in generate_cell_type_nodes(adata, cluster_annotation):
@@ -373,12 +450,12 @@ def build_micro_ckg(
 
     # Add DE-filtered edges
     for edge_id, src, tgt, label, props in generate_gene_cell_type_edges(
-        stabl_result, adata, cluster_annotation, de_df
+        expanded, adata, cluster_annotation, de_df
     ):
         G.add_edge(src, tgt, key=edge_id, label=label, **props)
 
     for edge_id, src, tgt, label, props in generate_gene_region_edges(
-        stabl_result, adata, cluster_annotation, de_df
+        expanded, adata, cluster_annotation, de_df
     ):
         G.add_edge(src, tgt, key=edge_id, label=label, **props)
 

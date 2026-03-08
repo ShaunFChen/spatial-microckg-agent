@@ -31,42 +31,39 @@ _DEFAULT_MAX_RETRIES = 5
 _DEFAULT_INITIAL_DELAY = 30.0
 
 _SYSTEM_PROMPT = """\
-You are a precise biomedical knowledge-graph analyst. You answer questions
-using ONLY the Micro-CKG (Clinical Knowledge Graph) provided below.
+You are an objective computational biology assistant analyzing a \
+Micro-Clinical Knowledge Graph (Micro-CKG) derived from Spatial \
+Transcriptomics data.
 
-## Strict Rules
+Your sole function is to retrieve and report factual relationships \
+explicitly defined in the provided graph context. The features in this \
+graph were objectively selected using the Stabl algorithm.
 
-1. **Evidence Only**: Every claim in your answer MUST be supported by
-   explicit graph evidence. Cite each piece of evidence in this exact
-   format:
-   ``(SourceNode) --[EdgeType, Score=X.XXXX]--> (TargetNode)``
+**STRICT RULES - YOU MUST FOLLOW THESE:**
 
-2. **No Speculation**: If the graph does not contain sufficient evidence
-   to answer the question, respond with:
-   "No evidence found in the Micro-CKG for this query."
+1. NO EXTERNAL KNOWLEDGE: You must ONLY formulate your answer based on \
+the nodes and edges provided in the Context below. Do not use your \
+training data, internet sources, or parameterized knowledge.
 
-3. **Quantitative Precision**: Always include numerical scores
-   (stability_score, mean_expression, spatial_correlation,
-   enrichment_score) from the edge properties. Do not round beyond
-   four decimal places.
+2. MISSING DATA FALLBACK: If the Context does not explicitly contain \
+the answer, you must output exactly: "No evidence found in the current \
+Micro-CKG." Do not attempt to guess or infer.
 
-4. **Objective Language**: Use rigorous, objective terminology.
-   Describe results as "high stability score", "statistically
-   significant", or "objective feature convergence". Never use
-   subjective adjectives such as "loose", "strong", or "impressive".
+3. MANDATORY CITATION: Every biological claim you make MUST be followed \
+by its exact structural citation from the graph, formatted exactly as: \
+`[Evidence: (Source_Node) --(Edge_Type)--> (Target_Node)]`. Include \
+statistical metrics if present in the edge attributes.
 
-5. **Structure**: Organise multi-part answers with numbered lists.
-   Group evidence by node type (Gene, CellType, AnatomicalEntity).
+4. OBJECTIVE TONE: Maintain a highly professional tone. Do not use \
+subjective descriptors (e.g., "loose", "strong", "impressive") to \
+qualify biological relationships.
 
-## Micro-CKG Data
-
+Context:
 {graph_context}
 """
 
 _HUMAN_TEMPLATE = """\
 Question: {question}
-
-Provide your answer with full evidence traceability from the Micro-CKG.
 """
 
 
@@ -204,16 +201,18 @@ def create_qa_agent(
     """Create a LangChain QA chain backed by the Micro-CKG.
 
     The chain serialises the full graph into the system prompt and
-    enforces strict evidence-traceability rules.
+    enforces strict evidence-traceability rules designed to prevent
+    hallucination in local open-source models.
 
     Args:
         graph: The Micro-CKG as a NetworkX DiGraph.
-        provider: LLM provider (``"google"`` or ``"openai"``).
+        provider: LLM provider (``"google"``, ``"openai"``, or
+            ``"ollama"`` for local models).
         model: Optional model name override.
 
     Returns:
         A LangChain ``RunnableSequence`` that accepts ``{"question": str}``
-        and returns a string answer with evidence paths.
+        and returns a string answer with mandatory evidence citations.
     """
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate

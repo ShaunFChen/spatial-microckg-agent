@@ -777,7 +777,7 @@ def run_stabl_cached(
         if "sample_id" in adata_work.obs.columns:
             adata_work = stratified_downsample(adata_work)
 
-    # 2) Gene pre-filtering (before ComBat)
+    # 2) Gene pre-filtering
     if prefilter == "de" and label_method == "condition":
         adata_sub = select_de_genes(
             adata_work, groupby="condition",
@@ -786,28 +786,27 @@ def run_stabl_cached(
     else:
         adata_sub = select_hvgs(adata_work, n_top=n_hvgs)
 
-    # 3) ComBat batch correction on the selected genes only
-    if "sample_id" in adata_sub.obs.columns:
-        adata_sub = batch_correct(adata_sub, batch_key="sample_id")
+    # No ComBat or scaling — keep sparse log-normalized matrix intact
+    # so Stabl's bootstrapping sees the full biological signal.
 
-    # 4) Label assignment
+    # 3) Label assignment
     if label_method == "condition":
         y = assign_condition_labels(adata_sub, method="condition")
     else:
         adata_sub = _compute_pca_and_clusters(adata_sub)
         y = assign_condition_labels(adata_sub, method=label_method)
 
-    # 5) Prepare dense matrix for Stabl
+    # 4) Prepare dense matrix for Stabl
     X = adata_sub.X
     if hasattr(X, "toarray"):
         X = X.toarray()
     X = np.asarray(X, dtype=np.float64)
     feature_names = list(adata_sub.var_names)
 
-    # 6) Run Stabl
+    # 5) Run Stabl
     result = run_stabl_selection(X, y, feature_names, n_bootstraps=n_bootstraps)
 
-    # 7) Persist cache
+    # 6) Persist cache
     with open(pkl_path, "wb") as f:
         pickle.dump(result, f)
 
@@ -827,18 +826,18 @@ def run_stabl_cached(
 
 
 def _has_spatial(adata: ad.AnnData) -> bool:
-    """Check whether AnnData has spatial coordinates and images.
+    """Check whether AnnData has spatial coordinates and library metadata.
 
     Args:
         adata: AnnData to inspect.
 
     Returns:
-        ``True`` if both ``obsm['spatial']`` and ``uns['spatial']`` exist.
+        ``True`` if spatial data exists for at least one library.
     """
-    return (
-        adata.obsm.get("spatial") is not None
-        and adata.uns.get("spatial") is not None
-    )
+    spatial_uns = adata.uns.get("spatial")
+    if spatial_uns is None or adata.obsm.get("spatial") is None:
+        return False
+    return len(spatial_uns) >= 1
 
 
 def _ensure_umap(adata: ad.AnnData) -> ad.AnnData:
@@ -873,13 +872,13 @@ def plot_spatial_markers(
     save_dir: Path | str,
     n_top: int = 5,
 ) -> list[Path]:
-    """Visualize marker gene expression with spatial or UMAP plots.
+    """Visualize marker gene expression with spatial H&E overlays or UMAP.
 
     Always includes **Prox1** (Hippocampus Dentate Gyrus marker) and
     AD inflammatory markers (Trem2, Gfap) alongside the top
     Stabl-selected genes.  If the AnnData contains spatial coordinates
-    and H&E images, generates spatial overlay plots.  Otherwise falls
-    back to UMAP embedding.
+    and H&E images, generates semi-transparent spatial overlay plots
+    using ``squidpy.pl.spatial_scatter``.  Otherwise falls back to UMAP.
 
     Args:
         adata: AnnData with expression data.
@@ -890,15 +889,25 @@ def plot_spatial_markers(
     Returns:
         List of paths to saved plot images.
     """
+    import warnings
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import squidpy as sq
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Use raw counts for expression overlay if available
-    plot_adata = adata.raw.to_adata() if adata.raw is not None else adata
+    plot_adata = adata.raw.to_adata() if adata.raw is not None else adata.copy()
+
+    # CRITICAL: Restore spatial metadata stripped by .raw.to_adata()
+    if "spatial" in adata.obsm:
+        plot_adata.obsm["spatial"] = adata.obsm["spatial"]
+    if "spatial" in adata.uns:
+        plot_adata.uns["spatial"] = adata.uns["spatial"]
+
+    use_spatial = _has_spatial(plot_adata)
 
     # Build gene list: top Stabl markers + Prox1 + AD markers (deduplicated)
     gene_list: list[str] = []
@@ -912,25 +921,70 @@ def plot_spatial_markers(
         print("  No requested markers found in dataset — skipping plots.")
         return []
 
-    use_spatial = _has_spatial(plot_adata)
     if not use_spatial:
         print("  Spatial coordinates not available — using UMAP fallback.")
         plot_adata = _ensure_umap(plot_adata)
 
+    # Pick one WT and one AD sample for side-by-side spatial plots
+    wt_lib: str | None = None
+    ad_lib: str | None = None
+    if use_spatial and "sample_id" in plot_adata.obs.columns and "condition" in plot_adata.obs.columns:
+        for sid in plot_adata.obs["sample_id"].unique():
+            cond = plot_adata.obs.loc[plot_adata.obs["sample_id"] == sid, "condition"].iloc[0]
+            if int(cond) == 0 and wt_lib is None:
+                wt_lib = str(sid)
+            elif int(cond) == 1 and ad_lib is None:
+                ad_lib = str(sid)
+
     saved: list[Path] = []
     for gene in gene_list:
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        if use_spatial:
-            sc.pl.spatial(
-                plot_adata,
-                color=gene,
-                ax=ax,
-                show=False,
-                title=f"{gene} — Spatial Expression",
-                frameon=False,
-            )
+        if use_spatial and wt_lib and ad_lib:
+            # Side-by-side WT vs AD on H&E tissue overlays
+            fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+            for ax, lib_id, label in zip(
+                axes, [wt_lib, ad_lib], ["WT", "AD"]
+            ):
+                sub = plot_adata[plot_adata.obs["sample_id"] == lib_id].copy()
+                sub.uns["spatial"] = {lib_id: plot_adata.uns["spatial"][lib_id]}
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    sq.pl.spatial_scatter(
+                        sub,
+                        color=gene,
+                        library_id=[lib_id],
+                        img_res_key="lowres",
+                        ax=ax,
+                        title=f"{label} ({lib_id}) — {gene}",
+                        frameon=False,
+                        cmap="magma",
+                        size=0.8,
+                        alpha=0.6,
+                        img=True,
+                    )
+            fig.tight_layout()
+            out_path = save_dir / f"spatial_{gene}.png"
+        elif use_spatial:
+            # Single-library fallback
+            lib_id = list(plot_adata.uns["spatial"].keys())[0]
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                sq.pl.spatial_scatter(
+                    plot_adata,
+                    color=gene,
+                    library_id=[lib_id],
+                    img_res_key="lowres",
+                    ax=ax,
+                    title=f"{gene} — Spatial Expression",
+                    frameon=False,
+                    cmap="magma",
+                    size=0.8,
+                    alpha=0.6,
+                    img=True,
+                )
             out_path = save_dir / f"spatial_{gene}.png"
         else:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
             sc.pl.umap(
                 plot_adata,
                 color=gene,

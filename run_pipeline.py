@@ -71,7 +71,7 @@ def main() -> None:
         cache_dir=CACHE_DIR,
         dataset_name="geo_ad",
         label_method="condition",
-        n_bootstraps=200,
+        n_bootstraps=50,
         prefilter="hvg",
         n_hvgs=2000,
     )

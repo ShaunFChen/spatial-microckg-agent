@@ -98,9 +98,8 @@ uv run jupyter lab notebooks/
 
 ## Notebooks
 
-The pipeline is designed to run as **6 sequential notebooks**, each producing
-outputs consumed by the next. Run them in order (01 → 05), or use the
-all-in-one Takeda Panel Demo.
+The pipeline is designed to run as **5 sequential notebooks**, each producing
+outputs consumed by the next. Run them in order (01 → 05).
 
 | Notebook | Title | Description |
 |----------|-------|-------------|
@@ -109,7 +108,6 @@ all-in-one Takeda Panel Demo.
 | `03_Spatial_Visualization.ipynb` | Spatial Visualization | Spatial/UMAP overlay of top Stabl markers + Prox1 (Hippocampus), Trem2, Gfap (AD) |
 | `04_Knowledge_Graph.ipynb` | Knowledge Graph & Drug Discovery | Leiden clustering → Micro-CKG → Moran's I validation → ortholog mapping → GO enrichment → ChEMBL drug targets |
 | `05_LLM_Agent.ipynb` | LLM Agent (Evidence-Traced QA) | Load Micro-CKG → Ollama `llama3.1:8b` → 3 drug-discovery queries with graph-evidence citations |
-| `Takeda_Panel_Demo.ipynb` | End-to-End Demo | All-in-one deliverable: ingestion → QC → Stabl → visualization → KG → LLM agent |
 
 ## Pipeline Steps
 

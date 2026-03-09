@@ -30,6 +30,7 @@ __all__ = [
     "run_stabl_selection",
     "run_stabl_cached",
     "plot_spatial_markers",
+    "plot_spatial_highcontrast",
 ]
 
 # ---------------------------------------------------------------------------
@@ -903,9 +904,10 @@ def plot_spatial_markers(
 
     # CRITICAL: Restore spatial metadata stripped by .raw.to_adata()
     if "spatial" in adata.obsm:
-        plot_adata.obsm["spatial"] = adata.obsm["spatial"].copy()
-        # Invert Y-axis to align spots with top-left-origin H&E images
-        plot_adata.obsm["spatial"][:, 1] = -plot_adata.obsm["spatial"][:, 1]
+        # Data ingestion stores [pxl_row, pxl_col]; squidpy expects [x, y]
+        # i.e. [pxl_col, pxl_row].  Swap columns to align with H&E.
+        raw_coords = adata.obsm["spatial"].copy()
+        plot_adata.obsm["spatial"] = raw_coords[:, ::-1]
     if "spatial" in adata.uns:
         plot_adata.uns["spatial"] = adata.uns["spatial"]
 
@@ -958,10 +960,11 @@ def plot_spatial_markers(
                         ax=ax,
                         title=f"{label} ({lib_id}) — {gene}",
                         frameon=False,
-                        cmap="magma",
-                        size=0.8,
-                        alpha=0.6,
+                        cmap="viridis",
+                        size=1.6,
+                        alpha=0.9,
                         img=True,
+                        img_alpha=0.3,
                     )
             fig.tight_layout()
             out_path = save_dir / f"spatial_{gene}.png"
@@ -979,10 +982,11 @@ def plot_spatial_markers(
                     ax=ax,
                     title=f"{gene} — Spatial Expression",
                     frameon=False,
-                    cmap="magma",
-                    size=0.8,
-                    alpha=0.6,
+                    cmap="viridis",
+                    size=1.6,
+                    alpha=0.9,
                     img=True,
+                    img_alpha=0.3,
                 )
             out_path = save_dir / f"spatial_{gene}.png"
         else:
@@ -1019,3 +1023,153 @@ def plot_spatial_markers(
         print(f"  Saved plot: {out_path}")
 
     return saved
+
+
+def plot_spatial_highcontrast(
+    adata: ad.AnnData,
+    gene: str,
+    save_path: Path | str,
+    *,
+    wt_sample: str | None = None,
+    ad_sample: str | None = None,
+    cmap: str = "magma",
+    img_alpha: float = 0.15,
+    spot_scale: float = 2.0,
+    vmax_percentile: float = 99.0,
+) -> Path:
+    """Generate a high-contrast side-by-side spatial expression overlay.
+
+    Creates a publication-quality figure with dimmed H&E background and
+    bright gene-expression overlay using percentile-based ``vmax`` for
+    compressed dynamic range and maximum signal visibility.
+
+    Args:
+        adata: AnnData with spatial coordinates, H&E images in
+            ``uns["spatial"]``, ``sample_id`` / ``condition`` metadata,
+            and expression data (or ``.raw``).
+        gene: Gene name to visualize.
+        save_path: Output path for the saved PNG file.
+        wt_sample: Sample ID for the WT condition.  Auto-detected from
+            ``condition == 0`` if ``None``.
+        ad_sample: Sample ID for the AD condition.  Auto-detected from
+            ``condition == 1`` if ``None``.
+        cmap: Matplotlib colormap name.
+        img_alpha: Opacity for the H&E background image (0–1).
+        spot_scale: Multiplicative scaling factor for Visium spot diameter.
+        vmax_percentile: Percentile of expression values used as the
+            color-scale ceiling.
+
+    Returns:
+        Path to the saved figure.
+
+    Raises:
+        ValueError: If *gene* is not found in the dataset.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    import matplotlib.cm as cm
+    from scipy.sparse import issparse
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use raw counts for expression overlay if available
+    expr_adata = adata.raw.to_adata() if adata.raw is not None else adata
+
+    if gene not in expr_adata.var_names:
+        raise ValueError(f"Gene '{gene}' not found in dataset")
+
+    # Auto-detect WT / AD sample IDs
+    if wt_sample is None or ad_sample is None:
+        for sid in adata.obs["sample_id"].unique():
+            cond = adata.obs.loc[
+                adata.obs["sample_id"] == sid, "condition"
+            ].iloc[0]
+            if int(cond) == 0 and wt_sample is None:
+                wt_sample = str(sid)
+            elif int(cond) == 1 and ad_sample is None:
+                ad_sample = str(sid)
+
+    # Extract expression vector for a sample mask
+    def _get_expr(mask: pd.Series) -> np.ndarray:
+        x_sub = expr_adata[mask, gene].X
+        if issparse(x_sub):
+            return np.asarray(x_sub.todense()).ravel()
+        return np.asarray(x_sub).ravel()
+
+    wt_mask = adata.obs["sample_id"] == wt_sample
+    ad_mask = adata.obs["sample_id"] == ad_sample
+    wt_expr = _get_expr(wt_mask)
+    ad_expr = _get_expr(ad_mask)
+
+    # Shared colour normalisation from the requested percentile
+    all_expr = np.concatenate([wt_expr, ad_expr])
+    vmax = float(np.percentile(all_expr, vmax_percentile))
+    norm = Normalize(vmin=0.0, vmax=vmax, clip=True)
+
+    # ---- Figure ----------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8), facecolor="#F0F0F0")
+
+    for ax, mask, expr_vals, sample_id, label in [
+        (axes[0], wt_mask, wt_expr, wt_sample, "WT"),
+        (axes[1], ad_mask, ad_expr, ad_sample, "AD"),
+    ]:
+        ax.set_facecolor("#F0F0F0")
+
+        # H&E background
+        sp = adata.uns["spatial"][sample_id]
+        img = sp["images"]["lowres"]
+        sf = sp["scalefactors"]["tissue_lowres_scalef"]
+        spot_diam = sp["scalefactors"]["spot_diameter_fullres"] * sf
+        ax.imshow(img, alpha=img_alpha)
+
+        # Spot coordinates in low-res pixel space
+        # obsm["spatial"] is [pxl_row, pxl_col]; swap for image coords
+        coords = adata[mask].obsm["spatial"].copy()
+        x = coords[:, 1] * sf   # pxl_col → horizontal
+        y = coords[:, 0] * sf   # pxl_row → vertical (matches imshow)
+
+        # Scatter overlay (s = area in points²)
+        s = (spot_diam * spot_scale * 0.5) ** 2
+        ax.scatter(
+            x,
+            y,
+            c=expr_vals,
+            cmap=cmap,
+            norm=norm,
+            s=s,
+            alpha=0.9,
+            edgecolors="none",
+            rasterized=True,
+        )
+
+        ax.set_title(
+            f"{label} ({sample_id}) \u2014 {gene}",
+            fontsize=14,
+            fontweight="bold",
+            color="black",
+        )
+        ax.axis("off")
+
+    # Single shared colorbar on the far right
+    cbar = fig.colorbar(
+        cm.ScalarMappable(norm=norm, cmap=cmap),
+        ax=axes.ravel().tolist(),
+        location="right",
+        fraction=0.02,
+        pad=0.02,
+        shrink=0.8,
+    )
+    cbar.set_label("Normalized Expression", fontsize=12)
+
+    fig.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
+    plt.close(fig)
+    print(f"  Saved high-contrast plot: {save_path}")
+    return save_path

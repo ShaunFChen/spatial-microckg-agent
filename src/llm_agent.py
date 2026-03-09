@@ -1,6 +1,6 @@
 """LLM-agnostic Graph QA agent with strict evidence traceability.
 
-Default provider: Google Gemini via ``langchain-google-genai``.
+Default provider: Ollama (local) via ``langchain-ollama``.
 The agent answers queries exclusively from the BioCypher Micro-CKG,
 citing exact ``(Source)--[Edge_Type, Score=X.XX]-->(Target)`` evidence
 paths. Speculation beyond graph contents is prohibited.
@@ -130,7 +130,7 @@ def get_llm(
         from langchain_ollama import ChatOllama
 
         return ChatOllama(
-            model=model or "llama3.1:8b",
+            model=model or "deepseek-r1:14b",
             temperature=temperature,
         )
 

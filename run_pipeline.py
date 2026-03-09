@@ -147,7 +147,7 @@ def main() -> None:
     from src.llm_agent import create_qa_agent, query_graph
 
     agent = create_qa_agent(graph, provider="ollama")
-    print("  Agent initialized (Ollama — llama3.1:8b).\n")
+    print("  Agent initialized (Ollama — deepseek-r1:14b).\n")
 
     test_question = (
         "What are the most significant genes associated with the "
@@ -164,7 +164,7 @@ def main() -> None:
     except Exception as exc:
         print(f"  Query failed: {type(exc).__name__}: {exc}")
         print("  Ensure Ollama is running locally (ollama serve) with "
-              "llama3.1:8b pulled.")
+              "deepseek-r1:14b pulled.")
 
     # ------------------------------------------------------------------
     # Done

@@ -22,9 +22,11 @@ __all__ = [
     "generate_gene_nodes",
     "generate_cell_type_nodes",
     "generate_anatomical_nodes",
+    "generate_drug_nodes",
     "generate_gene_cell_type_edges",
     "generate_gene_region_edges",
     "generate_cell_type_region_edges",
+    "generate_drug_gene_edges",
     "build_micro_ckg",
     "save_graph",
     "load_graph",
@@ -109,23 +111,119 @@ def generate_gene_nodes(
     ``is_selected=True``; genes added via the *min_genes* expansion
     are marked ``is_selected=False``.
 
+    If ``stabl_result`` contains an ``"ortho_map"`` key (a dict mapping
+    mouse gene symbol → human ortholog symbol), the ``human_ortholog``
+    property is included in each gene node's attributes when available.
+
     Args:
         stabl_result: Dictionary returned by ``run_stabl_selection``
-            (or expanded by :func:`_expand_gene_list`).
+            (or expanded by :func:`_expand_gene_list`).  May optionally
+            contain an ``"ortho_map"`` key.
 
     Yields:
         Tuples of ``(node_id, node_label, properties)`` for each gene.
     """
     n_orig = stabl_result.get("n_selected_original", len(stabl_result["selected_genes"]))
+    ortho_map = stabl_result.get("ortho_map", {})
     for idx, gene in enumerate(stabl_result["selected_genes"]):
         score = stabl_result["stability_scores"][gene]
+        props: dict[str, Any] = {
+            "symbol": gene,
+            "stability_score": round(score, 4),
+            "is_selected": idx < n_orig,
+        }
+        human_sym = ortho_map.get(gene)
+        if human_sym:
+            props["human_ortholog"] = human_sym
         yield (
             f"gene:{gene}",
             "gene",
+            props,
+        )
+
+
+def generate_drug_nodes(
+    drug_df: pd.DataFrame,
+) -> Iterator[tuple[str, str, dict[str, Any]]]:
+    """Yield BioCypher node tuples for approved drug compounds.
+
+    Expects a DataFrame produced by
+    :func:`~src.external_knowledge.get_drug_targets` with at least the
+    columns ``drug_name``, ``mechanism_of_action``, and ``max_phase``.
+
+    Args:
+        drug_df: DataFrame of drug-target entries from ChEMBL.
+
+    Yields:
+        Tuples of ``(node_id, node_label, properties)`` for each
+        unique drug compound.
+    """
+    if drug_df.empty:
+        return
+    seen: set[str] = set()
+    for _, row in drug_df.iterrows():
+        name = str(row.get("drug_name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        node_id = f"drug:{name.lower().replace(' ', '_')}"
+        yield (
+            node_id,
+            "drug",
             {
-                "symbol": gene,
-                "stability_score": round(score, 4),
-                "is_selected": idx < n_orig,
+                "name": name,
+                "mechanism_of_action": str(row.get("mechanism_of_action", "")),
+                "max_phase": int(float(row.get("max_phase", 0) or 0)),
+            },
+        )
+
+
+def generate_drug_gene_edges(
+    drug_df: pd.DataFrame,
+    ortho_map: dict[str, str] | None = None,
+) -> Iterator[tuple[str, str, str, str, dict[str, Any]]]:
+    """Yield drug → gene target edges from ChEMBL drug-target data.
+
+    Each edge links a drug compound node to a mouse gene node via the
+    human-ortholog mapping.  Only genes that appear in the graph are
+    targeted.
+
+    Args:
+        drug_df: DataFrame from :func:`~src.external_knowledge.get_drug_targets`
+            with columns ``gene``, ``drug_name``, ``mechanism_of_action``,
+            ``max_phase``.
+        ortho_map: Dict mapping mouse gene symbol → human ortholog symbol.
+            When supplied, the edge label includes the human ortholog.
+
+    Yields:
+        Tuples of ``(edge_id, source, target, label, properties)``.
+    """
+    if drug_df.empty:
+        return
+    if ortho_map is None:
+        ortho_map = {}
+    # Build reverse map: human symbol → mouse gene symbol
+    human_to_mouse: dict[str, str] = {v: k for k, v in ortho_map.items() if v}
+
+    for _, row in drug_df.iterrows():
+        human_gene = str(row.get("gene", "")).strip()
+        drug_name = str(row.get("drug_name", "")).strip()
+        if not human_gene or not drug_name:
+            continue
+        # Prefer mouse gene id if we have a reverse mapping; else use human gene
+        mouse_gene = human_to_mouse.get(human_gene, human_gene)
+        drug_node = f"drug:{drug_name.lower().replace(' ', '_')}"
+        gene_node = f"gene:{mouse_gene}"
+        edge_id = f"edge:drug_gene:{drug_name}_{mouse_gene}"
+        yield (
+            edge_id,
+            drug_node,
+            gene_node,
+            "drug_gene_association",
+            {
+                "mechanism_of_action": str(row.get("mechanism_of_action", "")),
+                "max_phase": int(float(row.get("max_phase", 0) or 0)),
+                "human_target": human_gene,
             },
         )
 
@@ -396,6 +494,8 @@ def build_micro_ckg(
     schema_path: Path | str | None = None,
     cluster_annotation: dict[str, str] | None = None,
     min_genes: int = _DEFAULT_MIN_GENES,
+    drug_df: pd.DataFrame | None = None,
+    ortho_map: dict[str, str] | None = None,
 ) -> nx.DiGraph:
     """Construct a BioCypher-backed Micro-CKG as a NetworkX DiGraph.
 
@@ -406,6 +506,10 @@ def build_micro_ckg(
     When Stabl selects fewer than *min_genes*, the top-ranked genes by
     stability score are included to ensure the graph is informative.
 
+    Drug nodes from ChEMBL are added when *drug_df* is supplied.
+    Human ortholog symbols are stored as a ``human_ortholog`` attribute
+    on gene nodes when *ortho_map* is supplied.
+
     Args:
         stabl_result: Dictionary from :func:`run_stabl_cached`.
         adata: AnnData with ``leiden`` clusters and raw expression.
@@ -413,10 +517,17 @@ def build_micro_ckg(
         cluster_annotation: Dict mapping cluster id to region label
             (from :func:`annotate_clusters`).
         min_genes: Minimum number of gene nodes (default 20).
+        drug_df: Optional DataFrame from
+            :func:`~src.external_knowledge.get_drug_targets` containing
+            drug-target associations from ChEMBL.  When provided, Drug
+            nodes and ``drug_gene_association`` edges are added.
+        ortho_map: Optional dict mapping mouse gene symbol → human
+            ortholog symbol.  Stored as a ``human_ortholog`` attribute on
+            each gene node and used to resolve drug→gene edges.
 
     Returns:
-        A NetworkX directed graph with Gene, CellType, and
-        AnatomicalEntity nodes plus DE-filtered association edges.
+        A NetworkX directed graph with Gene, CellType, AnatomicalEntity,
+        and optionally Drug nodes plus DE-filtered association edges.
     """
     # Expand gene list if fewer than min_genes were selected
     expanded = _expand_gene_list(stabl_result, min_genes=min_genes)
@@ -426,6 +537,11 @@ def build_micro_ckg(
             f"  Expanded gene list: {n_orig} Stabl-selected → "
             f"{len(expanded['selected_genes'])} genes (min_genes={min_genes})"
         )
+
+    # Attach ortho_map so generate_gene_nodes can embed human_ortholog
+    if ortho_map:
+        expanded = dict(expanded)
+        expanded["ortho_map"] = ortho_map
 
     print("  Running DE testing (Wilcoxon rank-sum)...")
     de_df = _run_de_analysis(adata, expanded["selected_genes"])
@@ -464,13 +580,33 @@ def build_micro_ckg(
     ):
         G.add_edge(src, tgt, key=edge_id, label=label, **props)
 
+    # Optionally add drug nodes and drug→gene edges
+    if drug_df is not None and not drug_df.empty:
+        for node_id, node_label, props in generate_drug_nodes(drug_df):
+            G.add_node(node_id, label=node_label, **props)
+        for edge_id, src, tgt, label, props in generate_drug_gene_edges(
+            drug_df, ortho_map
+        ):
+            # Only add the edge if the target gene node exists in the graph
+            if tgt in G:
+                G.add_edge(src, tgt, key=edge_id, label=label, **props)
+        drug_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "drug")
+        drug_edges = sum(
+            1 for _, _, d in G.edges(data=True) if d.get("label") == "drug_gene_association"
+        )
+        print(f"  Drug nodes added: {drug_nodes} compounds, {drug_edges} drug→gene edges")
+
     n_nodes = G.number_of_nodes()
     n_edges = G.number_of_edges()
     gene_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "gene")
     ct_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "cell_type")
     region_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "anatomical_entity")
+    drug_node_count = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "drug")
 
-    print(f"  Micro-CKG: {n_nodes} nodes ({gene_nodes} genes, {ct_nodes} cell types, {region_nodes} regions)")
+    node_breakdown = f"{gene_nodes} genes, {ct_nodes} cell types, {region_nodes} regions"
+    if drug_node_count:
+        node_breakdown += f", {drug_node_count} drugs"
+    print(f"  Micro-CKG: {n_nodes} nodes ({node_breakdown})")
     print(f"  Micro-CKG: {n_edges} edges (DE-filtered)")
     return G
 

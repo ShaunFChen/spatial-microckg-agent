@@ -49,7 +49,9 @@ technical variation while preserving condition-driven signal.
 
 The Stabl algorithm applies L1-penalised logistic regression with stability
 selection across 200 bootstrap iterations to objectively distill the 2,000 HVGs
-down to a sparse set of the most stable AD biomarker genes.
+down to a sparse set of the most stable AD biomarker genes. HVG selection defines
+the **initial candidate pool**; Stabl's stability selection subsequently distills
+this pool to a sparse final biomarker set (typically comprising <2% of the input candidates).
 
 ## Project Structure
 
@@ -104,7 +106,7 @@ outputs consumed by the next. Run them in order (01 → 05).
 | Notebook | Title | Description |
 |----------|-------|-------------|
 | `01_Data_Ingestion_QC.ipynb` | Data Ingestion & QC | Download 6 Visium samples from GEO GSE203424, QC filter, normalize, save `ad_preprocessed.h5ad` |
-| `02_Stabl_Feature_Selection.ipynb` | Stabl Feature Selection | Stratified downsample → 2,000 HVGs → ComBat → Stabl (200 bootstraps) → stable AD biomarkers |
+| `02_Stabl_Feature_Selection.ipynb` | Stabl Feature Selection | Stratified downsample → 2,000 HVG initial candidate pool → ComBat → Stabl (200 bootstraps) → final stable AD biomarkers (<2% of candidate pool) |
 | `03_Spatial_Visualization.ipynb` | Spatial Visualization | Spatial/UMAP overlay of top Stabl markers + Prox1 (Hippocampus), Trem2, Gfap (AD) |
 | `04_Knowledge_Graph.ipynb` | Knowledge Graph & Drug Discovery | Leiden clustering → Micro-CKG → Moran's I validation → ortholog mapping → GO enrichment → ChEMBL drug targets |
 | `05_LLM_Agent.ipynb` | LLM Agent (Evidence-Traced QA) | Load Micro-CKG → Ollama `llama3.1:8b` → 3 drug-discovery queries with graph-evidence citations |
@@ -116,7 +118,7 @@ outputs consumed by the next. Run them in order (01 → 05).
 | 1 | `data_ingestion.py` | Download 6 Visium samples from GEO GSE203424 (3 WT×CO + 3 PSAPP×CO) |
 | 2 | `spatial_pipeline.py` | QC filtering (≥200 genes/spot, <30% mito), normalization (10k CPM + log1p) |
 | 3 | `spatial_pipeline.py` | Unsupervised Stratified Downsampling (Leiden-based, 1,000 spots/sample) |
-| 4 | `spatial_pipeline.py` | HVG selection (2,000) → ComBat batch correction → Stabl stability selection |
+| 4 | `spatial_pipeline.py` | HVG selection (2,000, initial candidate pool) → ComBat batch correction → Stabl stability selection (final biomarker set) |
 | 5 | `spatial_pipeline.py` | Spatial marker overlay plots (including Prox1 anatomical verification) |
 | 6 | `biocypher_adapter.py` | Micro-CKG construction (NetworkX DiGraph, Wilcoxon DE-filtered edges) |
 | 7 | `spatial_analytics.py` | Spatial validation (Moran's I autocorrelation) |

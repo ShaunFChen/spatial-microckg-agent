@@ -31,6 +31,9 @@ __all__ = [
     "run_stabl_cached",
     "plot_spatial_markers",
     "plot_spatial_highcontrast",
+    "remap_condition_labels",
+    "set_plot_defaults",
+    "CONDITION_LABEL_MAP",
 ]
 
 # ---------------------------------------------------------------------------
@@ -90,10 +93,74 @@ REGION_LABELS: list[str] = [
     "Brainstem",
 ]
 
+# Explicit mapping from integer condition codes to display labels.
+# 0 = Wild-Type controls; 1 = PSAPP Alzheimer's disease model.
+CONDITION_LABEL_MAP: dict[int, str] = {0: "WT", 1: "PSAPP (AD)"}
+
 
 # ---------------------------------------------------------------------------
 # Data Loading & QC
 # ---------------------------------------------------------------------------
+
+
+def remap_condition_labels(adata: ad.AnnData) -> ad.AnnData:
+    """Add a human-readable condition label column to ``adata.obs``.
+
+    Maps the integer ``condition`` column (0 = WT, 1 = PSAPP) to a
+    display-friendly ``condition_label`` column using
+    :data:`CONDITION_LABEL_MAP`.  The resulting column is an ordered
+    :class:`pandas.Categorical` with ``"WT"`` first so that plot axes
+    read left-to-right from control to disease.
+
+    If ``condition_label`` already exists the operation is a no-op.
+
+    Args:
+        adata: AnnData with an ``obs["condition"]`` column of int dtype.
+
+    Returns:
+        The same AnnData object with ``obs["condition_label"]`` added
+        in-place.
+    """
+    if "condition_label" not in adata.obs.columns:
+        adata.obs["condition_label"] = pd.Categorical(
+            adata.obs["condition"].astype(int).map(CONDITION_LABEL_MAP),
+            categories=["WT", "PSAPP (AD)"],
+            ordered=True,
+        )
+    return adata
+
+
+def set_plot_defaults(fontsize: int = 12, dpi: int = 300) -> None:
+    """Apply publication-quality global matplotlib/seaborn defaults.
+
+    Sets ``rcParams`` for consistent font sizes, resolution, and clean
+    axis styling across all notebooks.  Should be called once at the
+    top of each plotting notebook.
+
+    Args:
+        fontsize: Base font size applied to axes labels and tick labels.
+        dpi: Figure resolution used for both on-screen display
+            (``figure.dpi``) and saved files (``savefig.dpi``).
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_style("whitegrid")
+    plt.rcParams.update(
+        {
+            "font.size": fontsize,
+            "axes.labelsize": fontsize,
+            "axes.titlesize": fontsize + 2,
+            "xtick.labelsize": fontsize - 1,
+            "ytick.labelsize": fontsize - 1,
+            "legend.fontsize": fontsize - 1,
+            "figure.dpi": dpi,
+            "savefig.dpi": dpi,
+            "axes.linewidth": 1.2,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+        }
+    )
 
 
 def load_adata(path: Path | str) -> ad.AnnData:
@@ -872,6 +939,7 @@ def plot_spatial_markers(
     markers: list[str],
     save_dir: Path | str,
     n_top: int = 5,
+    morans_scores: dict[str, tuple[float, float]] | None = None,
 ) -> list[Path]:
     """Visualize marker gene expression with spatial H&E overlays or UMAP.
 
@@ -886,6 +954,9 @@ def plot_spatial_markers(
         markers: Candidate marker genes sorted by stability score.
         save_dir: Directory to write PNG files.
         n_top: Maximum number of markers to plot.
+        morans_scores: Optional mapping of gene name to
+            ``(moran_I, p_value)`` tuples.  When provided, the Moran's I
+            statistic is appended to each plot title.
 
     Returns:
         List of paths to saved plot images.
@@ -941,12 +1012,19 @@ def plot_spatial_markers(
                 ad_lib = str(sid)
 
     saved: list[Path] = []
+    _cond_labels = [CONDITION_LABEL_MAP[0], CONDITION_LABEL_MAP[1]]
     for gene in gene_list:
+        # Build Moran's I annotation suffix for plot titles
+        morans_suffix = ""
+        if morans_scores and gene in morans_scores:
+            mi, pval = morans_scores[gene]
+            morans_suffix = f"  [Moran's I = {mi:.3f}, p = {pval:.2e}]"
+
         if use_spatial and wt_lib and ad_lib:
-            # Side-by-side WT vs AD on H&E tissue overlays
+            # Side-by-side WT vs PSAPP (AD) on H&E tissue overlays
             fig, axes = plt.subplots(1, 2, figsize=(16, 8))
             for ax, lib_id, label in zip(
-                axes, [wt_lib, ad_lib], ["WT", "AD"]
+                axes, [wt_lib, ad_lib], _cond_labels
             ):
                 sub = plot_adata[plot_adata.obs["sample_id"] == lib_id].copy()
                 sub.uns["spatial"] = {lib_id: plot_adata.uns["spatial"][lib_id]}
@@ -958,7 +1036,7 @@ def plot_spatial_markers(
                         library_id=[lib_id],
                         img_res_key="lowres",
                         ax=ax,
-                        title=f"{label} ({lib_id}) — {gene}",
+                        title=f"{label} ({lib_id}) — {gene}{morans_suffix}",
                         frameon=False,
                         cmap="viridis",
                         size=1.6,
@@ -1005,15 +1083,16 @@ def plot_spatial_markers(
         saved.append(out_path)
         print(f"  Saved plot: {out_path}")
 
-    # Bonus: UMAP colored by condition label (WT vs AD)
+    # Bonus: UMAP colored by human-readable condition label
     if not use_spatial and "condition" in plot_adata.obs.columns:
+        remap_condition_labels(plot_adata)
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         sc.pl.umap(
             plot_adata,
-            color="condition",
+            color="condition_label",
             ax=ax,
             show=False,
-            title="Condition (WT vs AD) — UMAP",
+            title="Condition (WT vs. PSAPP (AD)) — UMAP",
             frameon=False,
         )
         out_path = save_dir / "umap_condition.png"

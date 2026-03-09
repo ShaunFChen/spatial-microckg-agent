@@ -903,7 +903,9 @@ def plot_spatial_markers(
 
     # CRITICAL: Restore spatial metadata stripped by .raw.to_adata()
     if "spatial" in adata.obsm:
-        plot_adata.obsm["spatial"] = adata.obsm["spatial"]
+        plot_adata.obsm["spatial"] = adata.obsm["spatial"].copy()
+        # Invert Y-axis to align spots with top-left-origin H&E images
+        plot_adata.obsm["spatial"][:, 1] = -plot_adata.obsm["spatial"][:, 1]
     if "spatial" in adata.uns:
         plot_adata.uns["spatial"] = adata.uns["spatial"]
 

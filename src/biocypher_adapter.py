@@ -23,10 +23,12 @@ __all__ = [
     "generate_cell_type_nodes",
     "generate_anatomical_nodes",
     "generate_drug_nodes",
+    "generate_human_ortholog_nodes",
     "generate_gene_cell_type_edges",
     "generate_gene_region_edges",
     "generate_cell_type_region_edges",
     "generate_drug_gene_edges",
+    "generate_human_ortholog_edges",
     "build_micro_ckg",
     "save_graph",
     "load_graph",
@@ -202,19 +204,17 @@ def generate_drug_gene_edges(
         return
     if ortho_map is None:
         ortho_map = {}
-    # Build reverse map: human symbol → mouse gene symbol
-    human_to_mouse: dict[str, str] = {v: k for k, v in ortho_map.items() if v}
 
     for _, row in drug_df.iterrows():
         human_gene = str(row.get("gene", "")).strip()
         drug_name = str(row.get("drug_name", "")).strip()
         if not human_gene or not drug_name:
             continue
-        # Prefer mouse gene id if we have a reverse mapping; else use human gene
-        mouse_gene = human_to_mouse.get(human_gene, human_gene)
+        # Drug targets the human gene node directly; the human_gene→gene
+        # is_ortholog_of edge (added separately) completes the 3-hop path.
         drug_node = f"drug:{drug_name.lower().replace(' ', '_')}"
-        gene_node = f"gene:{mouse_gene}"
-        edge_id = f"edge:drug_gene:{drug_name}_{mouse_gene}"
+        gene_node = f"human_gene:{human_gene}"
+        edge_id = f"edge:drug_gene:{drug_name}_{human_gene}"
         yield (
             edge_id,
             drug_node,
@@ -225,6 +225,67 @@ def generate_drug_gene_edges(
                 "max_phase": int(float(row.get("max_phase", 0) or 0)),
                 "human_target": human_gene,
             },
+        )
+
+
+def generate_human_ortholog_nodes(
+    ortho_map: dict[str, str],
+) -> Iterator[tuple[str, str, dict[str, Any]]]:
+    """Yield BioCypher node tuples for human ortholog gene symbols.
+
+    Each unique human gene symbol appearing as a value in *ortho_map*
+    becomes a ``human_gene`` node in the Micro-CKG.  These nodes act as
+    the explicit intermediary in the Drug→HumanOrtholog→MouseGene
+    translational 3-hop evidence path.
+
+    Args:
+        ortho_map: Dict mapping mouse gene symbol → human gene symbol,
+            as constructed from
+            :func:`~src.external_knowledge.map_orthologs`.
+
+    Yields:
+        Tuples of ``(node_id, node_label, properties)`` for each
+        unique human gene symbol.
+    """
+    seen: set[str] = set()
+    for human_sym in ortho_map.values():
+        if not human_sym or human_sym in seen:
+            continue
+        seen.add(human_sym)
+        yield (
+            f"human_gene:{human_sym}",
+            "human_gene",
+            {
+                "symbol": human_sym,
+                "species": "human",
+            },
+        )
+
+
+def generate_human_ortholog_edges(
+    ortho_map: dict[str, str],
+) -> Iterator[tuple[str, str, str, str, dict[str, Any]]]:
+    """Yield is_ortholog_of edges from human ortholog nodes to mouse gene nodes.
+
+    Creates a directed ``is_ortholog_of`` edge from each human gene
+    node to its corresponding mouse gene node, forming the downstream
+    leg of the Drug→HumanOrtholog→MouseGene 3-hop path.
+
+    Args:
+        ortho_map: Dict mapping mouse gene symbol → human gene symbol.
+
+    Yields:
+        Tuples of ``(edge_id, source, target, label, properties)``.
+    """
+    for mouse_sym, human_sym in ortho_map.items():
+        if not mouse_sym or not human_sym:
+            continue
+        yield (
+            f"edge:ortholog:{human_sym}_{mouse_sym}",
+            f"human_gene:{human_sym}",
+            f"gene:{mouse_sym}",
+            "is_ortholog_of",
+            {"mouse_gene": mouse_sym},
         )
 
 

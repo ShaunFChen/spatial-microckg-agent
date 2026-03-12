@@ -761,24 +761,29 @@ def _cache_key(
     n_hvgs: int = DEFAULT_N_HVGS,
     fdr_alpha: float = DEFAULT_FDR_ALPHA,
     min_log2fc: float = DEFAULT_MIN_LOG2FC,
+    downsample: bool = True,
 ) -> str:
     """Compute a deterministic cache key string.
 
     Args:
         dataset_name: Identifier for the dataset (e.g. ``"squidpy"``).
         label_method: Label assignment method.
-        prefilter: Pre-filter strategy — ``"de"`` or ``"hvg"``.
+        prefilter: Pre-filter strategy — ``"de"``, ``"hvg"``, or ``"none"``.
         n_hvgs: Number of HVGs (used when ``prefilter="hvg"``).
         fdr_alpha: FDR threshold (used when ``prefilter="de"``).
         min_log2fc: Min |log2FC| (used when ``prefilter="de"``).
+        downsample: Whether stratified downsampling is enabled.
 
     Returns:
         A hex digest string.
     """
+    ds_tag = "" if downsample else "_nods"
     if prefilter == "de":
-        raw = f"{dataset_name}_de{fdr_alpha}_fc{min_log2fc}_{label_method}"
+        raw = f"{dataset_name}_de{fdr_alpha}_fc{min_log2fc}_{label_method}{ds_tag}"
+    elif prefilter == "none":
+        raw = f"{dataset_name}_allgenes_{label_method}{ds_tag}"
     else:
-        raw = f"{dataset_name}_{n_hvgs}_{label_method}"
+        raw = f"{dataset_name}_{n_hvgs}_{label_method}{ds_tag}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -792,6 +797,7 @@ def run_stabl_cached(
     prefilter: str = "hvg",
     fdr_alpha: float = DEFAULT_FDR_ALPHA,
     min_log2fc: float = DEFAULT_MIN_LOG2FC,
+    downsample: bool = True,
 ) -> dict[str, Any]:
     """Run Stabl with disk caching of results.
 
@@ -799,11 +805,12 @@ def run_stabl_cached(
     directly (completing in under one second). Otherwise runs the full
     Stabl computation and persists the results.
 
-    Two pre-filter strategies are supported:
+    Three pre-filter strategies are supported:
 
     - ``"de"`` — t-test differential expression with BH FDR correction
       (recommended when ground-truth condition labels are available).
-    - ``"hvg"`` — top-N highly variable genes (original behaviour).
+    - ``"hvg"`` — top-N highly variable genes.
+    - ``"none"`` — no gene pre-filtering; use all genes.
 
     Args:
         adata: Normalized AnnData (not yet subsetted).
@@ -812,10 +819,11 @@ def run_stabl_cached(
         n_hvgs: Number of HVGs (used when ``prefilter="hvg"``).
         label_method: Label assignment strategy.
         n_bootstraps: Number of Stabl bootstrap iterations.
-        prefilter: Gene pre-filter — ``"de"`` for t-test DE or
-            ``"hvg"`` for highly variable genes.
+        prefilter: Gene pre-filter — ``"de"``, ``"hvg"``, or
+            ``"none"`` (all genes).
         fdr_alpha: FDR threshold for DE pre-filter (default 0.01).
         min_log2fc: Minimum |log2FC| for DE pre-filter (default 0.5).
+        downsample: Whether to apply stratified downsampling.
 
     Returns:
         Stabl result dictionary (see :func:`run_stabl_selection`).
@@ -827,6 +835,7 @@ def run_stabl_cached(
         dataset_name, label_method,
         prefilter=prefilter, n_hvgs=n_hvgs,
         fdr_alpha=fdr_alpha, min_log2fc=min_log2fc,
+        downsample=downsample,
     )
     pkl_path = cache_dir / f"stabl_results_{key}.pkl"
     csv_path = cache_dir / f"stabl_features_{key}.csv"
@@ -839,14 +848,16 @@ def run_stabl_cached(
     # --- Fresh computation ---
     print("  No cache found — computing from scratch.")
 
-    # 1) Unsupervised Stratified Downsampling
+    # 1) Optional stratified downsampling
     adata_work = adata.copy()
-    if label_method == "condition":
+    if downsample and label_method == "condition":
         if "sample_id" in adata_work.obs.columns:
             adata_work = stratified_downsample(adata_work)
 
     # 2) Gene pre-filtering
-    if prefilter == "de" and label_method == "condition":
+    if prefilter == "none":
+        adata_sub = adata_work
+    elif prefilter == "de" and label_method == "condition":
         adata_sub = select_de_genes(
             adata_work, groupby="condition",
             fdr_alpha=fdr_alpha, min_log2fc=min_log2fc,

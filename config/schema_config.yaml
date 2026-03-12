@@ -42,14 +42,6 @@ drug:
     name: str
     max_phase: int
 
-human_gene:
-  represented_as: node
-  preferred_id: symbol
-  input_label: human_gene
-  properties:
-    symbol: str
-    species: str
-
 disease:
   represented_as: node
   preferred_id: name
@@ -156,23 +148,3 @@ gene to disease association:
   target: disease
   properties:
     disease_id: str
-
-human gene to mouse gene ortholog:
-  is_a: association
-  represented_as: edge
-  input_label: is_ortholog_of
-  source: human_gene
-  target: gene
-  properties:
-    mouse_gene: str
-
-drug to human gene association:
-  is_a: association
-  represented_as: edge
-  input_label: drug_gene_association
-  source: drug
-  target: human_gene
-  properties:
-    mechanism_of_action: str
-    max_phase: int
-    human_target: str

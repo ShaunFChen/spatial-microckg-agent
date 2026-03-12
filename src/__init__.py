@@ -10,4 +10,5 @@ __all__ = [
     "spatial_analytics",
     "external_knowledge",
     "graph_analytics",
+    "spatial_gat",
 ]

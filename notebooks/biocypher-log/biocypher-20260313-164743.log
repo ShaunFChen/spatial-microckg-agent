@@ -1,0 +1,55 @@
+2026-03-13 16:47:43,061	INFO	module:_logger
+This is BioCypher v0.12.5.
+2026-03-13 16:47:43,062	INFO	module:_logger
+Logging into `biocypher-log/biocypher-20260313-164743.log`.
+2026-03-13 16:47:43,062	DEBUG	module:_create
+Loading module biocypher._create.
+2026-03-13 16:47:43,063	DEBUG	module:_deduplicate
+Loading module biocypher._deduplicate.
+2026-03-13 16:47:43,116	DEBUG	module:_misc
+Loading module biocypher._misc.
+2026-03-13 16:47:43,116	DEBUG	module:_get
+Loading module biocypher._get.
+2026-03-13 16:47:43,117	DEBUG	module:_mapping
+Loading module biocypher._mapping.
+2026-03-13 16:47:43,128	DEBUG	module:_ontology
+Loading module biocypher._ontology.
+2026-03-13 16:47:43,128	DEBUG	module:_translate
+Loading module biocypher._translate.
+2026-03-13 16:47:43,129	DEBUG	module:_get_connector
+Loading module biocypher.output.connect._get_connector.
+2026-03-13 16:47:43,129	DEBUG	module:_get_in_memory_kg
+Loading module biocypher.output.in_memory._get_in_memory_kg.
+2026-03-13 16:47:43,131	DEBUG	module:_get_writer
+Loading module biocypher.output.write._get_writer.
+2026-03-13 16:47:43,131	DEBUG	module:_core
+Loading module biocypher._core.
+2026-03-13 16:48:10,575	INFO	module:_core
+Running BioCypher with schema configuration from /Users/shaunfchen/Documents/Repositories/spatial-microckg-agent/config/schema_config.yaml.
+2026-03-13 16:48:10,578	INFO	module:_ontology
+Loading ontologies...
+2026-03-13 16:48:10,579	INFO	module:_ontology
+Instantiating OntologyAdapter class for https://github.com/biolink/biolink-model/raw/v3.2.1/biolink-model.owl.ttl.
+2026-03-13 16:48:11,134	DEBUG	module:_translate
+Translating nodes to BioCypher
+2026-03-13 16:48:11,135	DEBUG	module:_translate
+Finished translating nodes to BioCypher.
+2026-03-13 16:48:11,136	DEBUG	module:_translate
+Translating edges to BioCypher
+2026-03-13 16:48:11,137	WARNING	module:_deduplicate
+Duplicate edge type gene to disease association found. 
+2026-03-13 16:48:11,137	DEBUG	module:_translate
+Finished translating edges to BioCypher.
+2026-03-13 16:48:11,149	INFO	module:_core
+No missing labels in input.
+2026-03-13 16:48:11,149	INFO	module:_core
+No duplicate nodes in input.
+2026-03-13 16:48:11,150	INFO	module:_core
+Duplicate edge types encountered (IDs in log): 
+    gene to disease association
+
+2026-03-13 16:48:11,150	DEBUG	module:_core
+Duplicate edge IDs encountered: 
+    edge:gene_disease:Padi2_rheumatoid_arthritis
+    edge:gene_disease:Syt2_presynaptic_congenital_myasthenic_syndro
+

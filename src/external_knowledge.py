@@ -167,6 +167,10 @@ def run_go_enrichment(
     if gene_set_libraries is None:
         gene_set_libraries = _ENRICHR_GENE_SET_LIBRARIES
 
+    if not human_genes:
+        print("  GO enrichment: no genes provided — skipping.")
+        return pd.DataFrame()
+
     cache_key = ",".join(sorted(human_genes)) + "|" + ",".join(gene_set_libraries)
     cache_file = _cache_path("enrichment", cache_key)
     cached = _load_cache(cache_file)
@@ -227,6 +231,10 @@ def get_string_ppi(
         print(f"  STRING PPI loaded from cache ({len(cached)} interactions)")
         return pd.DataFrame(cached)
 
+    if not human_genes:
+        print("  STRING PPI: no genes provided — skipping.")
+        return pd.DataFrame(columns=["protein1", "protein2", "gene1", "gene2", "score"])
+
     import requests  # noqa: PLC0415
 
     url = f"{_STRING_API_URL}/json/network"
@@ -269,6 +277,10 @@ def get_drug_targets(
         DataFrame with columns ``gene``, ``drug_name``,
         ``mechanism_of_action``, ``max_phase``.
     """
+    if not human_genes:
+        print("  Drug targets: no genes provided — skipping.")
+        return pd.DataFrame(columns=["gene", "drug_name", "mechanism_of_action", "max_phase"])
+
     cache_key = ",".join(sorted(human_genes))
     cache_file = _cache_path("drug_targets", cache_key)
     cached = _load_cache(cache_file)
@@ -312,26 +324,9 @@ def get_drug_targets(
         except Exception:  # noqa: BLE001
             continue
 
-    # Inject mock drugs for interview demo targets that ChEMBL may miss
-    _MOCK_DRUGS: list[dict[str, Any]] = [
-        {
-            "gene": "PRNP",
-            "drug_name": "Takeda-PrP-Inhibitor",
-            "mechanism_of_action": "Prion protein signaling inhibitor",
-            "max_phase": 4,
-        },
-        {
-            "gene": "FTH1",
-            "drug_name": "Takeda-Ferritin-Modulator",
-            "mechanism_of_action": "Iron homeostasis modulator",
-            "max_phase": 4,
-        },
-    ]
-    existing_pairs = {(r["gene"].upper(), r["drug_name"]) for r in rows}
-    for mock in _MOCK_DRUGS:
-        if any(g.upper() == mock["gene"] for g in human_genes):
-            if (mock["gene"], mock["drug_name"]) not in existing_pairs:
-                rows.append(mock)
+    # NOTE: No mock/synthetic drug entries are injected. If a target has
+    # no real ChEMBL matches, that is a valid scientific finding — an
+    # undrugged target represents a potential novel therapeutic opportunity.
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["gene", "drug_name"])
     _save_cache(cache_file, df.to_dict(orient="records"))
@@ -341,51 +336,119 @@ def get_drug_targets(
 
 def get_disease_associations(
     human_genes: list[str],
+    ensembl_map: dict[str, str] | None = None,
+    top_n: int = 5,
 ) -> pd.DataFrame:
-    """Fetch gene-disease associations via mygene.
+    """Fetch gene-disease associations via the OpenTargets Platform API.
+
+    Queries the OpenTargets GraphQL endpoint for each gene's top
+    disease associations (ranked by overall association score).
+    Requires Ensembl gene IDs; these can be supplied via *ensembl_map*
+    or will be resolved automatically via mygene.
 
     Args:
         human_genes: Human gene symbols.
+        ensembl_map: Optional dict mapping human gene symbol → Ensembl
+            gene ID (e.g. ``{"PRNP": "ENSG00000171867"}``).  When
+            ``None``, IDs are resolved via mygene.
+        top_n: Maximum number of disease associations per gene
+            (default 5).
 
     Returns:
         DataFrame with columns ``gene``, ``disease_name``,
-        ``disease_id``.
+        ``disease_id``, ``score``.
     """
+    if not human_genes:
+        print("  Disease associations: no genes provided — skipping.")
+        return pd.DataFrame(columns=["gene", "disease_name", "disease_id", "score"])
+
     cache_key = ",".join(sorted(human_genes))
-    cache_file = _cache_path("disease_assoc", cache_key)
+    cache_file = _cache_path("disease_ot", cache_key)
     cached = _load_cache(cache_file)
     if cached is not None:
         print(f"  Disease associations loaded from cache ({len(cached)} entries)")
         return pd.DataFrame(cached)
 
-    import mygene  # noqa: PLC0415
-    mg = mygene.MyGeneInfo()
+    # Build symbol → Ensembl ID mapping
+    if ensembl_map is None:
+        ensembl_map = _resolve_ensembl_ids(human_genes)
 
-    results = mg.querymany(
-        human_genes,
-        scopes="symbol",
-        fields="symbol,disease",
-        species="human",
-        returnall=False,
-    )
+    import urllib.request  # noqa: PLC0415
 
-    rows: list[dict[str, str]] = []
-    for hit in results:
-        if "notfound" in hit and hit["notfound"]:
+    _OT_URL = "https://api.platform.opentargets.org/api/v4/graphql"
+    _QUERY = """
+    query associatedDiseases($ensemblId: String!, $size: Int!) {
+      target(ensemblId: $ensemblId) {
+        associatedDiseases(page: {index: 0, size: $size}) {
+          rows { disease { id name } score }
+        }
+      }
+    }
+    """
+
+    rows: list[dict[str, Any]] = []
+    for gene in human_genes:
+        ens_id = ensembl_map.get(gene, "")
+        if not ens_id:
             continue
-        symbol = hit.get("symbol", hit.get("query", ""))
-        diseases = hit.get("disease", [])
-        if isinstance(diseases, dict):
-            diseases = [diseases]
-        for d in diseases:
-            if isinstance(d, dict):
+        payload = json.dumps(
+            {"query": _QUERY, "variables": {"ensemblId": ens_id, "size": top_n}},
+        ).encode()
+        req = urllib.request.Request(
+            _OT_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+                data = json.loads(resp.read())
+            target = data.get("data", {}).get("target")
+            if not target:
+                continue
+            for assoc in target.get("associatedDiseases", {}).get("rows", []):
+                disease = assoc.get("disease", {})
                 rows.append({
-                    "gene": symbol,
-                    "disease_name": d.get("name", ""),
-                    "disease_id": d.get("id", ""),
+                    "gene": gene,
+                    "disease_name": disease.get("name", ""),
+                    "disease_id": disease.get("id", ""),
+                    "score": round(assoc.get("score", 0.0), 4),
                 })
+        except Exception:  # noqa: BLE001
+            continue
 
     df = pd.DataFrame(rows)
     _save_cache(cache_file, df.to_dict(orient="records"))
     print(f"  Disease associations: {len(df)} for {df['gene'].nunique() if len(df) else 0} genes")
     return df
+
+
+def _resolve_ensembl_ids(human_genes: list[str]) -> dict[str, str]:
+    """Resolve human gene symbols to Ensembl IDs via mygene.
+
+    Args:
+        human_genes: List of human gene symbols.
+
+    Returns:
+        Dict mapping gene symbol → Ensembl gene ID.
+    """
+    import mygene  # noqa: PLC0415
+
+    mg = mygene.MyGeneInfo()
+    results = mg.querymany(
+        human_genes,
+        scopes="symbol",
+        fields="symbol,ensembl.gene",
+        species="human",
+        returnall=False,
+    )
+    mapping: dict[str, str] = {}
+    for hit in results:
+        if "notfound" in hit and hit["notfound"]:
+            continue
+        symbol = hit.get("symbol", hit.get("query", ""))
+        ensembl = hit.get("ensembl", {})
+        if isinstance(ensembl, list):
+            ensembl = ensembl[0]
+        if isinstance(ensembl, dict) and ensembl.get("gene"):
+            mapping[symbol] = ensembl["gene"]
+    return mapping

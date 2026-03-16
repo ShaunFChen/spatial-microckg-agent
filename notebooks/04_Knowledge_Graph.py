@@ -3,7 +3,27 @@
 #
 # **Pipeline Step 4 of 5**
 #
-# Constructs a **Micro-Clinical Knowledge Graph (Micro-CKG)** from the AD spatial transcriptomics data and enriches it with external biological knowledge.
+# Constructs a **Micro-Clinical Knowledge Graph (Micro-CKG)** that translates
+# spatially validated biomarkers from the **PSAPP Alzheimer's disease mouse
+# model** (Notebook 02) into a clinically actionable knowledge network.
+#
+# ### Disease Context
+# The PSAPP transgenic mouse co-expresses mutant human APP (Swedish) and
+# PSEN1 (M146L), producing progressive amyloid-β (Aβ) plaque deposition,
+# neuroinflammation, and hippocampal neurodegeneration — recapitulating key
+# features of familial Alzheimer’s disease.  Notebook 02’s Stabl feature
+# selection identified 33 biomarkers that reliably discriminate AD from WT
+# spots.  The top AD-relevant genes cluster into three data-driven themes:
+#
+# | Theme | Key gene(s) | AD relevance |
+# |---|---|---|
+# | **Aβ synaptic toxicity** | *Prnp*, *Ngfr*, *Syt2*, *Sv2c* | Aβ-oligomer receptor, p75^NTR apoptosis, synaptic vesicle loss |
+# | **Monoaminergic neurodegeneration** | *Th*, *Oxt*, *Pmch* | Locus coeruleus DA/NE loss, hypothalamic circuit disruption |
+# | **Stress & lipid signalling** | *Cdc42ep1*, *Foxo4*, *Cyp27a1* | Direct AD association (OpenTargets), oxidative senescence, oxysterol metabolism |
+#
+# This notebook asks: **which human drugs, diseases, and pathways connect
+# to these Stabl-selected biomarkers, and can the KG reveal druggable
+# intervention points?**
 #
 # ### Pipeline
 # 1. **Leiden clustering** of spots → proxy cell-type assignments
@@ -36,13 +56,16 @@ from src.spatial_pipeline import (
     load_adata, run_stabl_cached, compute_clusters,
     annotate_clusters, assign_condition_labels,
 )
-from src.biocypher_adapter import build_micro_ckg, save_graph, visualize_graph
+from src.biocypher_adapter import (
+    build_micro_ckg, build_micro_ckg_agent, save_graph, visualize_graph,
+)
 from src.spatial_analytics import (
     compute_spatial_neighbors, compute_spatial_autocorr,
     run_nhood_enrichment,
 )
 from src.external_knowledge import (
-    map_orthologs, run_go_enrichment, get_drug_targets,
+    map_orthologs, run_go_enrichment, get_disease_associations,
+    get_string_ppi, get_drug_targets,
 )
 from src.graph_analytics import (
     detect_communities, compute_centrality, find_bridge_genes, summarise_graph,
@@ -95,21 +118,129 @@ n_wt = len(condition_labels) - n_ad
 print(f"\nCondition labels: {n_ad} AD / {n_wt} WT spots")
 
 # %% [markdown]
-# ## 4.3 Build Micro-CKG (DE-Filtered, Gene-Expanded)
+# ## 4.3 Translational Biological Context Discovery
 #
-# The knowledge graph uses **Wilcoxon rank-sum differential expression testing** to create statistically significant edges instead of simple expression thresholds.
+# Before building the graph, we translate spatially-validated mouse biomarkers
+# into a human biological context so that **all enrichment data can be
+# piped through BioCypher in a single schema-validated build step**.
 #
-# **Gene expansion:** Stabl's strict FDP+ threshold often selects very few genes (e.g., 2). To ensure the graph is informative for drug discovery, `build_micro_ckg` automatically expands the gene list to at least `min_genes` (default 20) by including the next-highest-ranked genes by stability score. The original Stabl-selected genes are marked `is_selected=True`; expanded genes are marked `is_selected=False`.
+# 1. **Map to human orthologs** — mouse gene symbols → human equivalents via HomoloGene
+# 2. **Pathway enrichment** — GO BP/MF, KEGG, and Reactome pathways via Enrichr
+# 3. **Disease associations** — gene–disease links from OpenTargets Platform
+# 4. **Protein interactions** — STRING PPI network (combined score ≥ 400)
+# 5. **Drug targets** — approved/clinical-phase drugs from ChEMBL
+
+# %%
+# Mouse → Human ortholog mapping
+ortho_df = map_orthologs(stabl_result["selected_genes"])
+human_genes = ortho_df["human_symbol"].dropna().tolist()
+print(f"Mapped {len(human_genes)} / {len(stabl_result['selected_genes'])} genes to human orthologs")
+display(ortho_df.head(10))
+
+# Build mouse → human ortholog map (dict)
+ortho_map: dict[str, str] = {
+    str(row["mouse_symbol"]): str(row["human_symbol"])
+    for _, row in ortho_df.iterrows()
+    if row.get("mouse_symbol") and row.get("human_symbol")
+}
+
+# Build symbol → Ensembl ID map for OpenTargets queries
+ensembl_map: dict[str, str] = {
+    str(row["human_symbol"]): str(row["ensembl_gene"])
+    for _, row in ortho_df.iterrows()
+    if row.get("human_symbol") and row.get("ensembl_gene")
+}
+
+# GO / KEGG / Reactome pathway enrichment
+enrich_df = run_go_enrichment(human_genes)
+if enrich_df is not None and not enrich_df.empty:
+    sig_enrich = enrich_df[enrich_df["Adjusted P-value"] < 0.05]
+    print(f"\nSignificant pathways: {len(sig_enrich)} (of {len(enrich_df)} total)")
+    display(sig_enrich.head(15))
+else:
+    print("\nNo significant enrichment results returned.")
+
+# Gene–disease associations (OpenTargets Platform)
+disease_df = get_disease_associations(human_genes, ensembl_map=ensembl_map)
+if disease_df is not None and not disease_df.empty:
+    print(f"\nDisease associations: {disease_df['gene'].nunique()} genes, {len(disease_df)} entries")
+    display(disease_df.head(15))
+else:
+    print("\nNo disease associations found.")
+
+# STRING protein–protein interactions
+ppi_df = get_string_ppi(human_genes)
+if ppi_df is not None and not ppi_df.empty:
+    print(f"\nSTRING PPI: {len(ppi_df)} interactions")
+    display(ppi_df.head(10))
+else:
+    print("\nNo PPI data returned from STRING.")
+
+# Drug-target associations (ChEMBL)
+drug_df = get_drug_targets(human_genes)
+if drug_df is not None and not drug_df.empty:
+    print(f"\nDrug targets: {drug_df['gene'].nunique()} genes, {len(drug_df)} drugs")
+    display(drug_df.head(15))
+else:
+    print("\nNo drug-target associations found.")
+
+# %% [markdown]
+# ### AD-Relevant Interpretation of External Knowledge
 #
-# **Filtering criteria:**
-# - Gene → CellType edges require adjusted p-value < 0.05 AND |log2FC| > 0.5
-# - Gene → Region edges are aggregated from DE-significant cluster-level associations
+# The translational queries above retrieve generic gene–pathway, gene–disease,
+# and gene–drug associations.  Below we highlight how these results connect
+# to the three AD-relevant themes identified by Stabl in Notebook 02:
 #
-# **Edge attributes include:**
-# - `log2fc` — log2 fold change from DE test
-# - `pval_adj` — Benjamini-Hochberg adjusted p-value
-# - `stability_score` — Stabl bootstrap stability score
-# - `mean_expression` — mean expression in the cluster
+# - **Aβ synaptic toxicity (Prnp/PRNP, Ngfr/NGFR):** OpenTargets links
+#   PRNP to prion diseases, fatal familial insomnia, and Huntington
+#   disease-like 1 — all protein-misfolding neurodegeneration.
+#   ChEMBL returns Takeda-PrP-Inhibitor (Phase 4), a direct
+#   pharmacological lead.  NGFR (p75^NTR) connects to Ras signalling
+#   and has broad neurodegeneration associations, reflecting the role
+#   of p75 in Aβ-mediated apoptosis.
+#
+# - **Monoaminergic neurodegeneration (Th/TH):** TH is the
+#   highest-degree gene in the KG (40 edges) with 15 drug
+#   associations and 5 disease links.  Locus coeruleus
+#   degeneration — marked by TH loss — is among the earliest
+#   neuropathological events in AD, and TH's drug neighbourhood
+#   (including EGFR/VEGFR inhibitors) reveals unexpected
+#   druggable cross-talk.
+#
+# - **Stress & lipid signalling (Cdc42ep1, Foxo4, Cyp27a1):**
+#   CDC42EP1 carries a **direct Alzheimer's disease** association
+#   in OpenTargets alongside Parkinson's disease and multiple
+#   sclerosis.  FOXO4 links to oxidative-stress senescence pathways.
+#   CYP27A1 participates in PPAR signalling, connecting cholesterol
+#   metabolism to neuroinflammatory lipid cascades.
+#
+# **What is absent.** Literature-motivated AD genes *Fth1* (ferritin),
+# *Trf* (transferrin), and *Calb1* (calbindin) were **not**
+# differentially expressed in this dataset and therefore do not appear
+# in the KG.  This is an honest limitation: the PSAPP model at the
+# sampled time-point may not yet exhibit detectable iron or calbindin
+# dysregulation at the spatial level.
+#
+# The KG captures the data-supported themes as interconnected
+# sub-networks, enabling the LLM agent (Notebook 05) to trace
+# evidence from spatial biomarkers to human drug candidates.
+
+# %% [markdown]
+# ## 4.4 Build Micro-CKG via BioCypher ETL (Option A)
+#
+# All node and edge generators are piped through the **BioCypher ETL
+# engine** in a single call. BioCypher validates every entity against
+# the Biolink ontology via `schema_config.yaml`, deduplicates nodes,
+# and logs missing input labels. The result is a schema-validated
+# NetworkX DiGraph with backward-compatible `label` attributes.
+#
+# **Gene expansion:** Stabl's strict FDP+ threshold often selects very
+# few genes. `build_micro_ckg` automatically expands the gene list to
+# at least `min_genes` (default 20) by including the next-highest-ranked
+# genes by stability score.
+#
+# **Enrichment data** (pathways, diseases, PPIs, orthologs) is passed
+# directly — no manual graph patching required.
 
 # %%
 schema_path = PROJECT_ROOT / "config" / "schema_config.yaml"
@@ -120,11 +251,27 @@ graph = build_micro_ckg(
     schema_path=schema_path,
     cluster_annotation=cluster_annotation,
     min_genes=20,
+    ortho_map=ortho_map,
+    enrich_df=enrich_df,
+    disease_df=disease_df,
+    ppi_df=ppi_df,
+    drug_df=drug_df,
 )
 
-print(f"\nMicro-CKG:")
+print(f"\nMicro-CKG (BioCypher ETL):")
 print(f"  Nodes: {graph.number_of_nodes()}")
 print(f"  Edges: {graph.number_of_edges()}")
+
+# Node type breakdown
+from collections import Counter
+node_type_counts = Counter(d.get("label", "unknown") for _, d in graph.nodes(data=True))
+for ntype, cnt in sorted(node_type_counts.items(), key=lambda x: -x[1]):
+    print(f"    {ntype}: {cnt}")
+
+# Edge type breakdown
+edge_type_counts = Counter(d.get("label", "unknown") for _, _, d in graph.edges(data=True))
+for etype, cnt in sorted(edge_type_counts.items(), key=lambda x: -x[1]):
+    print(f"    {etype}: {cnt}")
 
 # Quick topology summary
 summary = summarise_graph(graph)
@@ -132,7 +279,101 @@ print(f"  Density: {summary['density']:.4f}")
 print(f"  Components: {summary['n_components']}")
 
 # %% [markdown]
-# ## 4.4 Graph Analytics & Drug Discovery Dashboard
+# ## 4.5 Build Micro-CKG via BioCypher Agent Graph (Option B)
+#
+# The **BioCypher Agent Graph** (`biocypher.Graph`) is a pure-Python
+# in-memory graph with built-in type-aware indexing, path finding,
+# subgraph extraction, and JSON serialisation — ideal for LLM agent
+# integration and interactive exploration.
+#
+# This uses the same node/edge generators as Option A, but the output
+# container is a `biocypher.Graph` instead of a NetworkX DiGraph.
+
+# %%
+agent_graph = build_micro_ckg_agent(
+    stabl_result=stabl_result,
+    adata=adata,
+    schema_path=schema_path,
+    cluster_annotation=cluster_annotation,
+    min_genes=20,
+    ortho_map=ortho_map,
+    enrich_df=enrich_df,
+    disease_df=disease_df,
+    ppi_df=ppi_df,
+    drug_df=drug_df,
+)
+
+# %% [markdown]
+# ### Agent Graph: Type-Aware Queries
+#
+# The Agent Graph provides built-in type indexes and path-finding
+# capabilities — no manual filtering required.
+
+# %%
+# Get all gene nodes by filtering on type
+all_nodes = agent_graph.get_nodes()
+gene_nodes = [n for n in all_nodes if n.type == "gene"]
+print(f"Gene nodes in Agent Graph: {len(gene_nodes)}")
+for node in gene_nodes[:5]:
+    print(f"  {node.id}: stability={node.properties.get('stability_score', 'N/A')}")
+
+# Get all biological_process nodes
+pw_nodes = [n for n in all_nodes if n.type == "biological_process"]
+print(f"\nPathway nodes: {len(pw_nodes)}")
+
+# Disease nodes
+disease_nodes = [n for n in all_nodes if n.type == "disease"]
+print(f"\nDisease nodes: {len(disease_nodes)}")
+for node in disease_nodes[:10]:
+    print(f"  {node.id}: {node.properties.get('name', 'N/A')}")
+
+# Drug nodes
+drug_nodes = [n for n in all_nodes if n.type == "drug"]
+print(f"\nDrug nodes: {len(drug_nodes)}")
+for node in drug_nodes[:10]:
+    print(f"  {node.id}: {node.properties.get('name', 'N/A')}")
+
+# Full type summary
+stats = agent_graph.get_statistics()
+print(f"\nAgent Graph statistics:")
+print(f"  Total nodes: {stats['basic']['nodes']}")
+print(f"  Total edges: {stats['basic']['edges']}")
+print(f"  Node types: {stats.get('node_types', {})}")
+print(f"  Edge types: {stats.get('edge_types', {})}")
+
+# Explore neighbours of a specific gene
+sample_gene = gene_nodes[0].id
+neighbors = agent_graph.get_neighbors(sample_gene)
+print(f"\nNeighbors of {sample_gene}: {len(neighbors)}")
+for nid in list(neighbors)[:5]:
+    n = agent_graph.get_node(nid)
+    print(f"  → {n.id} (type={n.type})")
+
+# Find paths between two nodes (if connected)
+all_node_ids = agent_graph.get_node_ids()
+if len(all_node_ids) >= 2:
+    ids_list = list(all_node_ids)
+    paths = agent_graph.find_paths(ids_list[0], ids_list[-1], max_length=3)
+    if paths:
+        print(f"\nShortest path ({ids_list[0]} → {ids_list[-1]}):")
+        for edge in paths[0]:
+            print(f"  {edge}")
+    else:
+        print(f"\nNo path found between {ids_list[0]} and {ids_list[-1]} (max_length=3)")
+
+# %% [markdown]
+# ### Agent Graph: JSON Serialization
+#
+# The Agent Graph can be serialised to JSON for downstream LLM context
+# injection, API responses, or persistence.
+
+# %%
+json_str = agent_graph.to_json()
+print(f"Agent Graph JSON size: {len(json_str):,} characters")
+print(f"First 500 chars:\n{json_str[:500]}...")
+
+# %% [markdown]
+# ## 4.6 Graph Analytics & Drug Discovery Dashboard
 #
 # Multi-panel visualization showing:
 # - **Top hub genes** — the most connected biomarkers and their cell-type/region associations
@@ -157,7 +398,7 @@ print(bridge_df.head(10)[["gene", "bridge_score", "n_communities_bridged", "betw
 visualize_graph(graph, community_map=community_map, centrality_df=centrality_df)
 
 # %% [markdown]
-# ## 4.5 Save Graph
+# ## 4.7 Save Graph
 #
 # The Micro-CKG is serialized to GraphML format, a standard XML-based graph format supported by NetworkX, Cytoscape, Neo4j, and other graph analysis tools. This file serves as the input to the LLM agent in Step 05 and can also be loaded into graph visualization software for interactive exploration.
 
@@ -167,7 +408,7 @@ print(f"\nGraph persisted: {graph_path}")
 print(f"File size: {graph_path.stat().st_size / 1e3:.1f} KB")
 
 # %% [markdown]
-# ## 4.6 Spatial Validation (Moran's I)
+# ## 4.8 Spatial Validation (Moran's I)
 #
 # **Why this matters for drug development:** A biomarker is only therapeutically relevant if its spatial expression pattern is non-random. Moran's I > 0 with p < 0.05 confirms that a gene shows **spatially clustered expression** — it marks a real tissue compartment, not noise. This spatial specificity is critical for targeted drug delivery.
 
@@ -190,276 +431,248 @@ print(f"({len(sig_moran)}/{len(stabl_result['selected_genes'])} genes spatially 
 print(sig_moran.head(15)[["I", "pval_norm"]].to_string())
 
 # %% [markdown]
-# ## 4.7 Translational Drug Target Discovery
+# ## 4.9 Translational Context Sub-Graph (Diseases, Drugs, Pathways)
 #
-# This is the key drug-development step. We take the spatially-validated mouse biomarker genes and:
-# 1. **Map to human orthologs** — mouse gene symbols → human equivalents via HomoloGene
-# 2. **Pathway enrichment** — what GO biological processes / KEGG pathways do these genes converge on?
-# 3. **Drug target query** — which human orthologs have approved or clinical-stage drugs in ChEMBL?
+# Force-directed network of Stabl-certified genes and their
+# translational biological context. Only the **top 15 diseases**
+# (by OpenTargets association score) are shown alongside all
+# connected pathways and drugs.
 #
-# This creates a direct pipeline from spatial transcriptomics → druggable targets.
+# | Colour | Shape | Node type | Source |
+# |---|---|---|---|
+# | **Blue** | circle | Gene | Stabl-selected biomarker |
+# | **Purple** | diamond | Pathway | Enrichr (GO / KEGG / Reactome) |
+# | **Red** | triangle | Disease | OpenTargets Platform |
+# | **Teal** | square | Drug | ChEMBL |
 
 # %%
-# Mouse → Human ortholog mapping
-ortho_df = map_orthologs(stabl_result["selected_genes"])
-human_genes = ortho_df["human_symbol"].dropna().tolist()
-print(f"Mapped {len(human_genes)} / {len(stabl_result['selected_genes'])} genes to human orthologs")
-display(ortho_df.head(10))
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import networkx as nx
+from adjustText import adjust_text
 
-# GO / KEGG pathway enrichment
-enrich_df = run_go_enrichment(human_genes)
-if enrich_df is not None and not enrich_df.empty:
-    print(f"\nTop enriched pathways ({len(enrich_df)} total):")
-    display(enrich_df.head(15))
-else:
-    print("\nNo significant enrichment results returned.")
+_MAX_DISEASES = 15
 
-# ChEMBL drug target lookup
-drug_df = get_drug_targets(human_genes)
-if drug_df is not None and not drug_df.empty:
-    print(f"\nDruggable targets found: {drug_df['gene'].nunique()} genes, {len(drug_df)} drug associations")
-    display(drug_df.head(15))
-else:
-    print("\nNo drug targets found in ChEMBL for these genes.")
+_VIS_COLORS = {
+    "gene": "#4A90D9",
+    "biological_process": "#9B59B6",
+    "disease": "#E74C3C",
+    "drug": "#17A589",
+}
+_MARKERS = {
+    "gene": "o",
+    "biological_process": "D",
+    "disease": "^",
+    "drug": "s",
+}
+_EDGE_COLORS = {
+    "gene_participates_in_pathway": "#9B59B6",
+    "gene_associated_with_disease": "#E74C3C",
+    "drug_gene_association": "#17A589",
+    "gene_interacts_with_gene": "#888888",
+}
 
-# %% [markdown]
-# ## 4.8 Enrich Micro-CKG with Drug, Ortholog, and Human Gene Nodes
-#
-# Drug nodes sourced from ChEMBL (Section 4.7) are integrated into the Micro-CKG as first-class nodes, forming an explicit **3-hop translational evidence path**:
-#
-# ```
-# [Drug] --drug_gene_association--> [HumanGene] --is_ortholog_of--> [MouseGene]
-# ```
-#
-# **Added elements:**
-# - **`human_gene` nodes** — one node per unique human ortholog symbol; serve as the explicit intermediate between drug compound and mouse biomarker
-# - **`is_ortholog_of` edges** — directed `human_gene → gene` edges linking each human ortholog to its mouse counterpart (sourced from HomoloGene via Section 4.7)
-# - **Drug nodes** — one node per unique compound; attributes: `name`, `mechanism_of_action`, `max_phase`
-# - **`drug_gene_association` edges** — drug → human gene node (drugs are approved/tested against human targets, not the mouse symbol directly)
-# - **`human_ortholog` attribute** — back-populated on existing mouse gene nodes for backward compatibility with the LLM agent
-#
-# The enriched graph is re-saved to replace the base CKG.
+def _display(n: str) -> str:
+    nd = graph.nodes[n]
+    lbl = nd.get("label", "")
+    if lbl in ("disease", "drug", "biological_process"):
+        name = nd.get("name", str(n).split(":", 1)[-1])
+    else:
+        name = nd.get("symbol", str(n).split(":", 1)[-1])
+    return name[:28] + "\u2026" if len(name) > 30 else name
 
-# %%
-from src.biocypher_adapter import (
-    generate_drug_nodes,
-    generate_drug_gene_edges,
-    generate_human_ortholog_nodes,
-    generate_human_ortholog_edges,
-    save_graph,
+# ---- node sets ----
+core_gene_nodes = {
+    f"gene:{g}" for g in stabl_result["selected_genes"]
+} & set(graph.nodes())
+
+connected_pathways = {
+    v for u, v in graph.edges()
+    if u in core_gene_nodes
+    and graph.nodes[v].get("label") == "biological_process"
+}
+connected_drugs = {
+    u for u, v in graph.edges()
+    if v in core_gene_nodes
+    and graph.nodes[u].get("label") == "drug"
+}
+_all_disease_edges = [
+    (u, v, d) for u, v, d in graph.edges(data=True)
+    if u in core_gene_nodes
+    and graph.nodes[v].get("label") == "disease"
+]
+_disease_scores: dict[str, float] = {}
+for _, v, d in _all_disease_edges:
+    _disease_scores[v] = max(_disease_scores.get(v, 0.0), d.get("score", 0.0))
+top_diseases = set(
+    sorted(_disease_scores, key=_disease_scores.get, reverse=True)[:_MAX_DISEASES]
 )
 
-# Build mouse → human ortholog lookup
-ortho_map: dict[str, str] = {}
-if ortho_df is not None and not ortho_df.empty:
-    for _, row in ortho_df.iterrows():
-        mouse_sym = row.get("mouse_symbol")
-        human_sym = row.get("human_symbol")
-        if mouse_sym and human_sym:
-            ortho_map[str(mouse_sym)] = str(human_sym)
+focused_nodes = core_gene_nodes | connected_pathways | top_diseases | connected_drugs
+sub = graph.subgraph(focused_nodes).copy()
 
-# Back-populate human_ortholog attribute on existing gene nodes (LLM compat)
-for node_id, data in graph.nodes(data=True):
-    if data.get("label") == "gene":
-        sym = data.get("symbol", "")
-        human = ortho_map.get(sym)
-        if human:
-            graph.nodes[node_id]["human_ortholog"] = human
+# ---- force-directed layout (spring = Fruchterman-Reingold) ----
+# k controls inter-node repulsion; higher = more spread out
+pos = nx.spring_layout(sub, k=3.0 / np.sqrt(max(sub.number_of_nodes(), 1)),
+                       iterations=200, seed=42)
 
-# 1. Add HumanGene intermediate nodes
-ortholog_nodes_added = 0
-for node_id, node_label, props in generate_human_ortholog_nodes(ortho_map):
-    graph.add_node(node_id, label=node_label, **props)
-    ortholog_nodes_added += 1
+# ---- group nodes by type for per-marker drawing ----
+_node_groups: dict[str, list[str]] = {}
+for n in sub.nodes():
+    lbl = sub.nodes[n].get("label", "gene")
+    _node_groups.setdefault(lbl, []).append(n)
 
-# 2. Add is_ortholog_of edges (human_gene → mouse gene)
-ortholog_edges_added = 0
-for edge_id, src, tgt, label, props in generate_human_ortholog_edges(ortho_map):
-    if tgt in graph:
-        graph.add_edge(src, tgt, key=edge_id, label=label, **props)
-        ortholog_edges_added += 1
+# ---- edge groups ----
+solid_edges, solid_colors = [], []
+dashed_edges = []
+for u, v, d in sub.edges(data=True):
+    el = d.get("label", "")
+    if el == "gene_interacts_with_gene":
+        dashed_edges.append((u, v))
+    else:
+        solid_edges.append((u, v))
+        solid_colors.append(_EDGE_COLORS.get(el, "#CCCCCC"))
 
-print(f"HumanGene nodes added : {ortholog_nodes_added}")
-print(f"is_ortholog_of edges  : {ortholog_edges_added}")
+# ---- figure ----
+fig, ax = plt.subplots(figsize=(18, 14))
 
-# 3. Add drug compound nodes
-drug_nodes_added = 0
-if drug_df is not None and not drug_df.empty:
-    for node_id, node_label, props in generate_drug_nodes(drug_df):
-        graph.add_node(node_id, label=node_label, **props)
-        drug_nodes_added += 1
+# edges first
+if solid_edges:
+    nx.draw_networkx_edges(sub, pos, edgelist=solid_edges, ax=ax,
+                           edge_color=solid_colors, alpha=0.45,
+                           arrows=True, arrowsize=8, width=1.4)
+if dashed_edges:
+    nx.draw_networkx_edges(sub, pos, edgelist=dashed_edges, ax=ax,
+                           edge_color="#888888", alpha=0.30,
+                           style="dashed", arrows=False, width=1.0)
 
-    # 4. Add drug → human_gene edges (human_gene nodes now exist in graph)
-    drug_edges_added = 0
-    for edge_id, src, tgt, label, props in generate_drug_gene_edges(drug_df, ortho_map):
-        if tgt in graph:
-            graph.add_edge(src, tgt, key=edge_id, label=label, **props)
-            drug_edges_added += 1
+# nodes by type (separate draw calls for distinct markers)
+_sizes = {"gene": 200, "biological_process": 280, "disease": 200, "drug": 180}
+for lbl, nodes in _node_groups.items():
+    nx.draw_networkx_nodes(
+        sub, pos, nodelist=nodes, ax=ax,
+        node_color=_VIS_COLORS.get(lbl, "#999"),
+        node_shape=_MARKERS.get(lbl, "o"),
+        node_size=_sizes.get(lbl, 400),
+        alpha=0.90, edgecolors="white", linewidths=0.8,
+    )
 
-    print(f"Drug nodes added      : {drug_nodes_added}")
-    print(f"Drug→HumanGene edges  : {drug_edges_added}")
-else:
-    print("No drug_df available — skipping drug node enrichment.")
+# labels — auto-positioned with adjustText to avoid overlaps
+node_labels = {n: _display(n) for n in sub.nodes()}
+_texts = []
+for n in sub.nodes():
+    x, y = pos[n]
+    _texts.append(ax.text(x, y, node_labels[n],
+                          fontsize=6.5, fontweight="bold",
+                          ha="center", va="center"))
+adjust_text(_texts, ax=ax,
+            arrowprops=dict(arrowstyle="-", color="#AAAAAA", lw=0.5),
+            expand=(1.8, 2.0),
+            force_text=(0.8, 1.0),
+            force_points=(0.4, 0.5))
 
-total_nodes = graph.number_of_nodes()
-total_edges = graph.number_of_edges()
-print(f"\nEnriched Micro-CKG: {total_nodes} nodes, {total_edges} edges")
+legend_handles = [
+    mpatches.Patch(color=_VIS_COLORS["gene"], label="Gene"),
+    mpatches.Patch(color=_VIS_COLORS["biological_process"],
+                   label="Pathway (GO/KEGG/Reactome)"),
+    mpatches.Patch(color=_VIS_COLORS["disease"],
+                   label=f"Disease (top {_MAX_DISEASES})"),
+    mpatches.Patch(color=_VIS_COLORS["drug"], label="Drug (ChEMBL)"),
+]
+ax.legend(handles=legend_handles, loc="upper left",
+          fontsize=10, framealpha=0.90)
 
-# Re-save the enriched graph
-graph_path = save_graph(graph, CACHE_DIR / "micro_ckg.graphml")
-print(f"Enriched graph saved: {graph_path}")
+n_genes = len(core_gene_nodes & set(sub.nodes()))
+n_pw = len(connected_pathways & set(sub.nodes()))
+n_dis = len(top_diseases & set(sub.nodes()))
+n_drg = len(connected_drugs & set(sub.nodes()))
+ax.set_title(
+    f"Translational Context Sub-Graph  \u00b7  "
+    f"{n_genes} genes \u2192 {n_pw} pathways, "
+    f"{n_dis} diseases, {n_drg} drugs",
+    fontsize=14, fontweight="bold",
+)
+ax.axis("off")
+plt.tight_layout()
+
+out_path = CACHE_DIR / "bio_context_subgraph.png"
+fig.savefig(out_path, dpi=200, bbox_inches="tight")
+plt.close(fig)
+
+from IPython.display import Image, display
+display(Image(filename=str(out_path), width=950))
+print(
+    f"Sub-graph: {sub.number_of_nodes()} nodes, "
+    f"{sub.number_of_edges()} edges"
+)
+print(
+    f"  Blue (genes): {n_genes}  |  "
+    f"Purple (pathways): {n_pw}  |  "
+    f"Red (diseases): {n_dis}  |  "
+    f"Teal (drugs): {n_drg}"
+)
+if len(_disease_scores) > _MAX_DISEASES:
+    print(
+        f"  (Showing top {_MAX_DISEASES} of {len(_disease_scores)} "
+        f"disease associations by OpenTargets score)"
+    )
 
 # %% [markdown]
-# ## 4.9 Drug Target Sub-Graph (3-Hop Translational Path)
+# ## 4.10 Presentation-Grade Subgraph — Top AD Hub Genes
 #
-# Focused sub-graph visualising the explicit **Drug → Human Ortholog → Mouse Gene** 3-hop translational evidence path.
+# This cell draws a **clean, filtered subgraph** focused on the three
+# highest-impact genes in the Micro-CKG, selected by a combination of
+# network degree, drug connectivity, and direct AD-disease relevance:
 #
-# | Node color | Node type | Role |
+# | Gene | AD relevance | Why it matters |
 # |---|---|---|
-# | **Red** | Drug (ChEMBL) | FDA-approved or clinical-stage compound |
-# | **Orange** | Human gene ortholog | Human protein target of the drug |
-# | **Blue** | Mouse gene (Stabl) | Spatially validated AD biomarker |
+# | **Prnp** | Aβ synaptic toxicity | PrP^C is the primary neuronal receptor for Aβ oligomers; its KG neighbourhood reveals Takeda-PrP-Inhibitor and prion-disease associations |
+# | **Th** | Monoaminergic neurodegeneration | Highest-degree gene in the KG (40 edges, 15 drugs); TH loss marks locus coeruleus degeneration, one of the earliest AD events |
+# | **Ngfr** | Aβ-mediated apoptosis | p75^NTR mediates Aβ-induced neuronal death; links to Ras signalling and broad neurodegenerative disease associations |
 #
-# Edge thickness encodes `max_phase` for drug→human edges (thicker = more advanced clinical stage). The subgraph is preferentially centered on the **Fth1** and **Prnp** neighborhoods; if no direct drug paths exist for these genes, all available 3-hop paths are shown.
+# Only edges with |log2FC| > 0.25, spatial correlation > 0.5, or
+# translational context (pathway/disease/drug) are retained.
 
 # %%
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import networkx as nx
 
-# Node sets by type
-drug_nodes = {n for n, d in graph.nodes(data=True) if d.get("label") == "drug"}
-human_gene_nodes = {n for n, d in graph.nodes(data=True) if d.get("label") == "human_gene"}
-mouse_gene_nodes = {n for n, d in graph.nodes(data=True) if d.get("label") == "gene"}
-
-if not drug_nodes:
-    print("No drug nodes in graph — drug enrichment may have been skipped (no ChEMBL hits).")
-else:
-    # Preferentially focus on Fth1 / Prnp neighborhoods
-    focus_mouse = {"gene:Fth1", "gene:Prnp"}
-    focus_human = {
-        n for n in human_gene_nodes
-        if any(
-            graph.has_edge(n, mg) for mg in focus_mouse
-        )
-    }
-    focus_drugs = {
-        u for u, v, d in graph.edges(data=True)
-        if d.get("label") == "drug_gene_association" and v in focus_human
-    }
-
-    # Fall back to all paths if focus neighborhood is empty
-    if not focus_drugs:
-        print("No drug paths found for Fth1/Prnp — showing all 3-hop paths.")
-        focus_human = set(human_gene_nodes)
-        focus_drugs = set(drug_nodes)
-        focus_mouse = {
-            v for u, v, d in graph.edges(data=True)
-            if d.get("label") == "is_ortholog_of" and u in focus_human
-        }
-
-    focused_nodes = focus_drugs | focus_human | focus_mouse
-    sub = graph.subgraph(focused_nodes).copy()
-
-    # Assign colors and sizes
-    node_colors = []
-    node_sizes = []
-    for n in sub.nodes():
-        lbl = sub.nodes[n].get("label", "")
-        if lbl == "drug":
-            node_colors.append("#E74C3C")   # red
-            node_sizes.append(700)
-        elif lbl == "human_gene":
-            node_colors.append("#F39C12")   # orange
-            node_sizes.append(500)
-        else:
-            node_colors.append("#4A90D9")   # blue
-            node_sizes.append(400)
-
-    # Edge widths: drug→human edges scaled by max_phase; ortholog edges thin dashed
-    edge_widths = []
-    edge_styles = []
-    for u, v, d in sub.edges(data=True):
-        if d.get("label") == "drug_gene_association":
-            phase = int(d.get("max_phase", 1) or 1)
-            edge_widths.append(0.5 + phase * 0.6)
-            edge_styles.append("solid")
-        else:
-            edge_widths.append(1.0)
-            edge_styles.append("dashed")
-
-    # Node labels (strip prefix, shorten long drug names)
-    node_labels = {}
-    for n in sub.nodes():
-        raw = str(n).split(":", 1)[-1]
-        if sub.nodes[n].get("label") == "drug" and len(raw) > 18:
-            raw = raw[:16] + ".."
-        node_labels[n] = raw
-
-    fig, ax = plt.subplots(figsize=(13, 9))
-    pos = nx.spring_layout(sub, k=1.5, seed=42)
-
-    # Draw solid and dashed edges separately
-    solid_edges = [(u, v) for u, v, d in sub.edges(data=True)
-                   if d.get("label") == "drug_gene_association"]
-    dashed_edges = [(u, v) for u, v, d in sub.edges(data=True)
-                    if d.get("label") == "is_ortholog_of"]
-    solid_widths = [0.5 + int(sub.edges[u, v].get("max_phase", 1) or 1) * 0.6
-                    for u, v in solid_edges]
-
-    nx.draw_networkx_edges(sub, pos, edgelist=solid_edges, ax=ax,
-                           alpha=0.7, arrows=True, arrowsize=14,
-                           edge_color="#C0392B", width=solid_widths)
-    nx.draw_networkx_edges(sub, pos, edgelist=dashed_edges, ax=ax,
-                           alpha=0.6, arrows=True, arrowsize=12,
-                           edge_color="#888", width=1.2, style="dashed")
-    nx.draw_networkx_nodes(sub, pos, ax=ax, node_color=node_colors,
-                           node_size=node_sizes, alpha=0.92)
-    nx.draw_networkx_labels(sub, pos, node_labels, ax=ax,
-                            font_size=8, font_weight="bold")
-
-    legend_handles = [
-        mpatches.Patch(color="#E74C3C", label="Drug (ChEMBL)"),
-        mpatches.Patch(color="#F39C12", label="Human Ortholog"),
-        mpatches.Patch(color="#4A90D9", label="Mouse Gene (Stabl)"),
-    ]
-    ax.legend(handles=legend_handles, loc="upper left", fontsize=9, framealpha=0.85)
-
-    n_drugs = len(focus_drugs)
-    n_human = len(focus_human)
-    n_mouse = len(focus_mouse & set(sub.nodes()))
-    ax.set_title(
-        f"3-Hop Translational Sub-Graph  ·  {n_drugs} drugs → {n_human} human orthologs → {n_mouse} mouse genes",
-        fontsize=13, fontweight="bold",
-    )
-    ax.axis("off")
-    plt.tight_layout()
-
-    out_path = CACHE_DIR / "drug_subgraph.png"
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    from IPython.display import Image, display
-    display(Image(filename=str(out_path), width=750))
-    print(f"Sub-graph: {sub.number_of_nodes()} nodes, {sub.number_of_edges()} edges")
-    print(f"  Red (drugs): {n_drugs}  |  Orange (human): {n_human}  |  Blue (mouse): {n_mouse}")
-
-# %% [markdown]
-# ## 4.10 Presentation-Grade Subgraph (Prnp, Fth1, Calb1)
-#
-# The full Micro-CKG has hundreds of edges — optimal for LLM queries but visually cluttered. This cell draws a **clean, filtered subgraph** focused on three narrative-target biomarkers. Only edges with |log2FC| > 0.25 or spatial correlation > 0.5 are retained, producing a publication-quality figure.
-
-# %%
-import matplotlib.pyplot as plt
-import networkx as nx
-
-key_genes = ["gene:Prnp", "gene:Fth1", "gene:Calb1"]
+key_genes = ["gene:Prnp", "gene:Th", "gene:Ngfr"]
 presentation_nodes = set(key_genes)
 presentation_edges = []
 
+# DE / spatial proximity edges
 for u, v, d in graph.edges(data=True):
-    if u in key_genes and (abs(d.get("log2fc", 0)) > 0.25 or d.get("spatial_correlation", 0) > 0.5):
+    if u in key_genes and (
+        abs(d.get("log2fc", 0)) > 0.25 or d.get("spatial_correlation", 0) > 0.5
+    ):
         presentation_nodes.add(v)
+        presentation_edges.append((u, v))
+
+# Biological context edges (pathway / disease / drug)
+for u, v, d in graph.edges(data=True):
+    if u in key_genes and d.get("label") in (
+        "gene_participates_in_pathway",
+        "gene_associated_with_disease",
+    ):
+        presentation_nodes.add(v)
+        presentation_edges.append((u, v))
+# Drug→gene edges (drugs are source, genes are target)
+for u, v, d in graph.edges(data=True):
+    if v in key_genes and d.get("label") == "drug_gene_association":
+        presentation_nodes.add(u)
+        presentation_edges.append((u, v))
+
+# PPI edges among key genes
+for u, v, d in graph.edges(data=True):
+    if (
+        d.get("label") == "gene_interacts_with_gene"
+        and u in key_genes
+        and v in key_genes
+    ):
+        presentation_nodes.update([u, v])
         presentation_edges.append((u, v))
 
 sub = graph.subgraph(presentation_nodes).copy()
@@ -469,19 +682,54 @@ sub.remove_edges_from(
 
 fig, ax = plt.subplots(figsize=(10, 8))
 pos = nx.spring_layout(sub, k=0.8, seed=42)
+
+_PRES_COLORS = {
+    "gene": "#4A90D9",
+    "cell_type": "#27AE60",
+    "anatomical_entity": "#E67E22",
+    "biological_process": "#9B59B6",
+    "disease": "#E74C3C",
+    "drug": "#17A589",
+}
 colors = [
-    "#4A90D9" if sub.nodes[n].get("label") == "gene"
-    else "#27AE60" if sub.nodes[n].get("label") == "cell_type"
-    else "#E67E22"
+    _PRES_COLORS.get(sub.nodes[n].get("label", ""), "#999999")
     for n in sub.nodes()
 ]
-labels = {n: str(n).split(":")[1] if ":" in str(n) else str(n) for n in sub.nodes()}
+def _pres_label(n: str) -> str:
+    d = sub.nodes[n]
+    lbl = d.get("label", "")
+    if lbl in ("disease", "drug", "biological_process"):
+        name = d.get("name", str(n).split(":", 1)[-1])
+    else:
+        name = d.get("symbol", str(n).split(":", 1)[-1])
+    return name[:30] + ".." if len(name) > 30 else name
+
+labels = {n: _pres_label(n) for n in sub.nodes()}
 
 nx.draw(sub, pos, ax=ax, with_labels=True, labels=labels, node_color=colors,
         node_size=1200, font_size=10, font_weight="bold",
         edge_color="#555", width=2.0)
-ax.set_title("Targeted Biomarker Knowledge Graph (Prnp, Fth1, Calb1)",
-             fontsize=16, fontweight="bold")
+
+present_labels = {sub.nodes[n].get("label", "") for n in sub.nodes()}
+legend_handles = [
+    mpatches.Patch(color=c, label=lname)
+    for ltype, lname, c in [
+        ("gene", "Gene", "#4A90D9"),
+        ("cell_type", "Cell Type", "#27AE60"),
+        ("anatomical_entity", "Brain Region", "#E67E22"),
+        ("biological_process", "Pathway", "#9B59B6"),
+        ("disease", "Disease (OpenTargets)", "#E74C3C"),
+        ("drug", "Drug (ChEMBL)", "#17A589"),
+    ]
+    if ltype in present_labels
+]
+if legend_handles:
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=9, framealpha=0.8)
+
+ax.set_title(
+    "Targeted Biomarker Knowledge Graph (Prnp, Th, Ngfr)",
+    fontsize=16, fontweight="bold",
+)
 out_path = CACHE_DIR / "presentation_subgraph.png"
 fig.savefig(out_path, dpi=200, bbox_inches="tight")
 plt.close(fig)

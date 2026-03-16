@@ -8,6 +8,7 @@ ontology to produce an in-memory NetworkX directed graph.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -17,17 +18,26 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import yaml
+from biocypher import BioCypher
+from biocypher import Graph as BCGraph
 
 __all__ = [
     "generate_gene_nodes",
     "generate_cell_type_nodes",
     "generate_anatomical_nodes",
+    "generate_pathway_nodes",
+    "generate_disease_nodes",
     "generate_drug_nodes",
     "generate_gene_cell_type_edges",
     "generate_gene_region_edges",
     "generate_cell_type_region_edges",
+    "generate_gene_pathway_edges",
+    "generate_gene_disease_edges",
+    "generate_ppi_edges",
     "generate_drug_gene_edges",
     "build_micro_ckg",
+    "build_micro_ckg_agent",
     "save_graph",
     "load_graph",
     "visualize_graph",
@@ -39,6 +49,17 @@ __all__ = [
 _DE_PVAL_THRESHOLD = 0.10
 _DE_LOG2FC_THRESHOLD = 0.1
 _DEFAULT_MIN_GENES = 20
+_PATHWAY_PVAL_THRESHOLD = 0.05
+_PATHWAY_MAX_NODES = 50
+
+# Default paths for BioCypher configuration files.
+_DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "config" / "schema_config.yaml"
+_DEFAULT_BIOCYPHER_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "biocypher_config.yaml"
+)
+
+# Compiled regex for sanitising arbitrary text into safe node-ID segments.
+_UNSAFE_ID_RE = re.compile(r"[^a-z0-9]+")
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +316,90 @@ def generate_anatomical_nodes(
             )
 
 
+def generate_pathway_nodes(
+    enrich_df: pd.DataFrame,
+    *,
+    pval_threshold: float = _PATHWAY_PVAL_THRESHOLD,
+    max_pathways: int = _PATHWAY_MAX_NODES,
+) -> Iterator[tuple[str, str, dict[str, Any]]]:
+    """Yield BioCypher node tuples for enriched biological pathways.
+
+    Selects the top significant pathways from GO/KEGG/Reactome enrichment
+    results, sorted by adjusted p-value.
+
+    Args:
+        enrich_df: DataFrame from
+            :func:`~src.external_knowledge.run_go_enrichment` with columns
+            ``Term``, ``Adjusted P-value``, ``Gene_set_library``,
+            ``Genes``, and ``Combined Score``.
+        pval_threshold: Maximum adjusted p-value for inclusion.
+        max_pathways: Upper bound on pathway nodes emitted.
+
+    Yields:
+        Tuples of ``(node_id, node_label, properties)`` for each unique
+        enriched pathway term.
+    """
+    if enrich_df.empty:
+        return
+    sig = enrich_df[enrich_df["Adjusted P-value"] < pval_threshold].copy()
+    sig = sig.sort_values("Adjusted P-value").head(max_pathways)
+    seen: set[str] = set()
+    for _, row in sig.iterrows():
+        term = str(row.get("Term", "")).strip()
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        node_id = f"pathway:{_UNSAFE_ID_RE.sub('_', term.lower()).strip('_')[:80]}"
+        yield (
+            node_id,
+            "biological_process",
+            {
+                "name": term,
+                "source_library": str(row.get("Gene_set_library", "")),
+                "pval_adj": float(row.get("Adjusted P-value", 1.0)),
+                "combined_score": float(row.get("Combined Score", 0.0)),
+            },
+        )
+
+
+def generate_disease_nodes(
+    disease_df: pd.DataFrame,
+) -> Iterator[tuple[str, str, dict[str, Any]]]:
+    """Yield BioCypher node tuples for gene-disease associations.
+
+    Args:
+        disease_df: DataFrame from
+            :func:`~src.external_knowledge.get_disease_associations` with
+            columns ``gene``, ``disease_name``, ``disease_id``.
+
+    Yields:
+        Tuples of ``(node_id, node_label, properties)`` for each unique
+        disease.
+    """
+    if disease_df.empty:
+        return
+    seen: set[str] = set()
+    for _, row in disease_df.iterrows():
+        name = str(row.get("disease_name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        disease_id = str(row.get("disease_id", "")).strip()
+        node_id = (
+            f"disease:{disease_id}"
+            if disease_id
+            else f"disease:{_UNSAFE_ID_RE.sub('_', name.lower()).strip('_')[:80]}"
+        )
+        yield (
+            node_id,
+            "disease",
+            {
+                "name": name,
+                "disease_id": disease_id,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Edge Generators
 # ---------------------------------------------------------------------------
@@ -484,9 +589,349 @@ def generate_cell_type_region_edges(
         )
 
 
+def generate_gene_pathway_edges(
+    stabl_result: dict[str, Any],
+    enrich_df: pd.DataFrame,
+    ortho_map: dict[str, str] | None = None,
+    *,
+    pval_threshold: float = _PATHWAY_PVAL_THRESHOLD,
+) -> Iterator[tuple[str, str, str, str, dict[str, Any]]]:
+    """Yield gene → pathway participation edges.
+
+    A mouse gene is linked to a pathway when its human ortholog appears
+    in the pathway's enriched gene list from Enrichr.
+
+    Args:
+        stabl_result: Stabl result dict containing ``selected_genes``.
+        enrich_df: DataFrame from
+            :func:`~src.external_knowledge.run_go_enrichment` with columns
+            ``Term``, ``Adjusted P-value``, ``Gene_set_library``,
+            ``Genes``, and ``Combined Score``.
+        ortho_map: Dict mapping mouse gene symbol → human ortholog symbol.
+        pval_threshold: Maximum adjusted p-value for pathway inclusion.
+
+    Yields:
+        Tuples of ``(edge_id, source, target, label, properties)``.
+    """
+    if enrich_df.empty:
+        return
+    if ortho_map is None:
+        ortho_map = {}
+    # Reverse map: human symbol UPPERCASE → mouse gene symbol
+    human_to_mouse: dict[str, str] = {v.upper(): k for k, v in ortho_map.items() if v}
+    selected_set = set(stabl_result["selected_genes"])
+    sig = enrich_df[enrich_df["Adjusted P-value"] < pval_threshold].copy()
+    for _, row in sig.iterrows():
+        term = str(row.get("Term", "")).strip()
+        if not term:
+            continue
+        pathway_id = f"pathway:{_UNSAFE_ID_RE.sub('_', term.lower()).strip('_')[:80]}"
+        genes_str = str(row.get("Genes", ""))
+        gene_list = [
+            g.strip().upper()
+            for g in genes_str.replace(";", ",").split(",")
+            if g.strip()
+        ]
+        for human_upper in gene_list:
+            mouse_gene = human_to_mouse.get(human_upper)
+            if not mouse_gene or mouse_gene not in selected_set:
+                continue
+            edge_id = (
+                f"edge:gene_pathway:{mouse_gene}_"
+                f"{_UNSAFE_ID_RE.sub('_', term.lower())[:40]}"
+            )
+            yield (
+                edge_id,
+                f"gene:{mouse_gene}",
+                pathway_id,
+                "gene_participates_in_pathway",
+                {
+                    "pval_adj": float(row.get("Adjusted P-value", 1.0)),
+                    "combined_score": float(row.get("Combined Score", 0.0)),
+                    "source_library": str(row.get("Gene_set_library", "")),
+                },
+            )
+
+
+def generate_gene_disease_edges(
+    stabl_result: dict[str, Any],
+    disease_df: pd.DataFrame,
+    ortho_map: dict[str, str] | None = None,
+) -> Iterator[tuple[str, str, str, str, dict[str, Any]]]:
+    """Yield gene → disease association edges.
+
+    A mouse gene is linked to a disease when its human ortholog has a
+    documented association in the mygene disease database.
+
+    Args:
+        stabl_result: Stabl result dict containing ``selected_genes``.
+        disease_df: DataFrame from
+            :func:`~src.external_knowledge.get_disease_associations` with
+            columns ``gene``, ``disease_name``, ``disease_id``.
+        ortho_map: Dict mapping mouse gene symbol → human ortholog symbol.
+
+    Yields:
+        Tuples of ``(edge_id, source, target, label, properties)``.
+    """
+    if disease_df.empty:
+        return
+    if ortho_map is None:
+        ortho_map = {}
+    human_to_mouse: dict[str, str] = {v.upper(): k for k, v in ortho_map.items() if v}
+    selected_set = set(stabl_result["selected_genes"])
+    for _, row in disease_df.iterrows():
+        human_gene = str(row.get("gene", "")).strip().upper()
+        disease_name = str(row.get("disease_name", "")).strip()
+        if not human_gene or not disease_name:
+            continue
+        mouse_gene = human_to_mouse.get(human_gene)
+        if not mouse_gene or mouse_gene not in selected_set:
+            continue
+        disease_id = str(row.get("disease_id", "")).strip()
+        disease_node = (
+            f"disease:{disease_id}"
+            if disease_id
+            else f"disease:{_UNSAFE_ID_RE.sub('_', disease_name.lower()).strip('_')[:80]}"
+        )
+        edge_id = (
+            f"edge:gene_disease:{mouse_gene}_"
+            f"{_UNSAFE_ID_RE.sub('_', disease_name.lower())[:40]}"
+        )
+        yield (
+            edge_id,
+            f"gene:{mouse_gene}",
+            disease_node,
+            "gene_associated_with_disease",
+            {
+                "disease_id": disease_id,
+                "score": float(row.get("score", 0.0)),
+            },
+        )
+
+
+def generate_ppi_edges(
+    ppi_df: pd.DataFrame,
+    ortho_map: dict[str, str] | None = None,
+) -> Iterator[tuple[str, str, str, str, dict[str, Any]]]:
+    """Yield gene ↔ gene protein-protein interaction edges from STRING.
+
+    Both endpoints must resolve to mouse gene nodes via *ortho_map*.
+    Duplicate undirected pairs and self-loops are skipped.
+
+    Args:
+        ppi_df: DataFrame from
+            :func:`~src.external_knowledge.get_string_ppi` with columns
+            ``gene1``, ``gene2``, ``score``.
+        ortho_map: Dict mapping mouse gene symbol → human ortholog symbol.
+
+    Yields:
+        Tuples of ``(edge_id, source, target, label, properties)``.
+    """
+    if ppi_df.empty:
+        return
+    if ortho_map is None:
+        ortho_map = {}
+    human_to_mouse: dict[str, str] = {v.upper(): k for k, v in ortho_map.items() if v}
+    seen_pairs: set[frozenset[str]] = set()
+    for _, row in ppi_df.iterrows():
+        g1_upper = str(row.get("gene1", "")).strip().upper()
+        g2_upper = str(row.get("gene2", "")).strip().upper()
+        mouse1 = human_to_mouse.get(g1_upper)
+        mouse2 = human_to_mouse.get(g2_upper)
+        if not mouse1 or not mouse2 or mouse1 == mouse2:
+            continue
+        pair: frozenset[str] = frozenset({mouse1, mouse2})
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        edge_id = f"edge:ppi:{min(mouse1, mouse2)}_{max(mouse1, mouse2)}"
+        yield (
+            edge_id,
+            f"gene:{mouse1}",
+            f"gene:{mouse2}",
+            "gene_interacts_with_gene",
+            {
+                "string_score": float(row.get("score", 0)),
+                "human_gene1": g1_upper,
+                "human_gene2": g2_upper,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Graph Builder
 # ---------------------------------------------------------------------------
+
+
+def _collect_nodes(
+    expanded: dict[str, Any],
+    adata: ad.AnnData,
+    cluster_annotation: dict[str, str] | None,
+    drug_df: pd.DataFrame | None,
+    enrich_df: pd.DataFrame | None,
+    disease_df: pd.DataFrame | None,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Collect all node tuples from the individual generators.
+
+    Args:
+        expanded: Expanded Stabl result dict.
+        adata: AnnData with ``leiden`` clusters.
+        cluster_annotation: Cluster → region mapping.
+        drug_df: Optional drug-target DataFrame.
+        enrich_df: Optional enrichment DataFrame.
+        disease_df: Optional disease-association DataFrame.
+
+    Returns:
+        List of ``(node_id, input_label, properties)`` tuples.
+    """
+    nodes: list[tuple[str, str, dict[str, Any]]] = []
+    nodes.extend(generate_gene_nodes(expanded))
+    nodes.extend(generate_cell_type_nodes(adata, cluster_annotation))
+    nodes.extend(generate_anatomical_nodes(adata, cluster_annotation))
+    if drug_df is not None and not drug_df.empty:
+        nodes.extend(generate_drug_nodes(drug_df))
+    if enrich_df is not None and not enrich_df.empty:
+        nodes.extend(generate_pathway_nodes(enrich_df))
+    if disease_df is not None and not disease_df.empty:
+        nodes.extend(generate_disease_nodes(disease_df))
+    return nodes
+
+
+def _collect_edges(
+    expanded: dict[str, Any],
+    adata: ad.AnnData,
+    cluster_annotation: dict[str, str] | None,
+    de_df: pd.DataFrame,
+    drug_df: pd.DataFrame | None,
+    ortho_map: dict[str, str] | None,
+    enrich_df: pd.DataFrame | None,
+    disease_df: pd.DataFrame | None,
+    ppi_df: pd.DataFrame | None,
+    node_ids: set[str],
+) -> list[tuple[str | None, str, str, str, dict[str, Any]]]:
+    """Collect all edge tuples from the individual generators.
+
+    Only edges whose source and target exist in *node_ids* are kept.
+
+    Args:
+        expanded: Expanded Stabl result dict.
+        adata: AnnData with ``leiden`` clusters.
+        cluster_annotation: Cluster → region mapping.
+        de_df: Pre-computed DE results.
+        drug_df: Optional drug-target DataFrame.
+        ortho_map: Optional mouse→human gene mapping.
+        enrich_df: Optional enrichment DataFrame.
+        disease_df: Optional disease-association DataFrame.
+        ppi_df: Optional STRING PPI DataFrame.
+        node_ids: Set of node IDs present in the graph.
+
+    Returns:
+        List of ``(edge_id, source, target, input_label, properties)``
+        tuples.
+    """
+    edges: list[tuple[str | None, str, str, str, dict[str, Any]]] = []
+
+    for eid, src, tgt, lbl, props in generate_gene_cell_type_edges(
+        expanded, adata, cluster_annotation, de_df
+    ):
+        edges.append((eid, src, tgt, lbl, props))
+
+    for eid, src, tgt, lbl, props in generate_gene_region_edges(
+        expanded, adata, cluster_annotation, de_df
+    ):
+        edges.append((eid, src, tgt, lbl, props))
+
+    for eid, src, tgt, lbl, props in generate_cell_type_region_edges(
+        adata, cluster_annotation
+    ):
+        edges.append((eid, src, tgt, lbl, props))
+
+    if drug_df is not None and not drug_df.empty:
+        for eid, src, tgt, lbl, props in generate_drug_gene_edges(drug_df, ortho_map):
+            if tgt in node_ids:
+                edges.append((eid, src, tgt, lbl, props))
+
+    if enrich_df is not None and not enrich_df.empty:
+        for eid, src, tgt, lbl, props in generate_gene_pathway_edges(
+            expanded, enrich_df, ortho_map
+        ):
+            if src in node_ids:
+                edges.append((eid, src, tgt, lbl, props))
+
+    if disease_df is not None and not disease_df.empty:
+        for eid, src, tgt, lbl, props in generate_gene_disease_edges(
+            expanded, disease_df, ortho_map
+        ):
+            if src in node_ids:
+                edges.append((eid, src, tgt, lbl, props))
+
+    if ppi_df is not None and not ppi_df.empty:
+        for eid, src, tgt, lbl, props in generate_ppi_edges(ppi_df, ortho_map):
+            if src in node_ids and tgt in node_ids:
+                edges.append((eid, src, tgt, lbl, props))
+
+    return edges
+
+
+def _build_input_label_map(schema_path: Path | str) -> dict[str, str]:
+    """Build ``{input_label: schema_key}`` lookup from the schema YAML.
+
+    Args:
+        schema_path: Path to the ``schema_config.yaml``.
+
+    Returns:
+        Mapping from ``input_label`` values to their schema key names.
+    """
+    with open(schema_path) as fh:
+        schema = yaml.safe_load(fh)
+    mapping: dict[str, str] = {}
+    for key, cfg in schema.items():
+        if isinstance(cfg, dict) and "input_label" in cfg:
+            mapping[cfg["input_label"]] = key
+    return mapping
+
+
+def _postprocess_networkx(
+    G: nx.DiGraph,
+    input_label_map: dict[str, str],
+) -> nx.DiGraph:
+    """Normalise BioCypher ``to_networkx()`` output for backward compat.
+
+    BioCypher stores the node type under ``node_label`` and the edge
+    type under ``relationship_label``.  Downstream code in this project
+    expects a ``label`` attribute whose value is the ``input_label``
+    (e.g. ``gene``, ``cell_type``, ``gene_cell_type_association``).
+
+    This function copies the input_label into a ``label`` attribute on
+    every node and edge so that existing analytics and visualisation code
+    continues to work unchanged.
+
+    Args:
+        G: NetworkX DiGraph returned by ``BioCypher.to_networkx()``.
+        input_label_map: Mapping ``{input_label: schema_key}``.
+
+    Returns:
+        The same graph, mutated in-place, with ``label`` attributes set.
+    """
+    # Reverse map: schema_key → input_label
+    schema_to_input: dict[str, str] = {v: k for k, v in input_label_map.items()}
+
+    for _, d in G.nodes(data=True):
+        schema_name = d.get("node_label", "")
+        d["label"] = schema_to_input.get(schema_name, schema_name.replace(" ", "_"))
+        # GraphML does not support None values — replace with empty string.
+        for key in list(d):
+            if d[key] is None:
+                d[key] = ""
+
+    for _, _, d in G.edges(data=True):
+        schema_name = d.get("relationship_label", "")
+        d["label"] = schema_to_input.get(schema_name, schema_name.replace(" ", "_"))
+        for key in list(d):
+            if d[key] is None:
+                d[key] = ""
+
+    return G
 
 
 def build_micro_ckg(
@@ -497,39 +942,54 @@ def build_micro_ckg(
     min_genes: int = _DEFAULT_MIN_GENES,
     drug_df: pd.DataFrame | None = None,
     ortho_map: dict[str, str] | None = None,
+    enrich_df: pd.DataFrame | None = None,
+    disease_df: pd.DataFrame | None = None,
+    ppi_df: pd.DataFrame | None = None,
 ) -> nx.DiGraph:
     """Construct a BioCypher-backed Micro-CKG as a NetworkX DiGraph.
 
+    Pipes node and edge generators through the real ``BioCypher`` ETL
+    engine, which validates entities against the Biolink ontology via
+    ``schema_config.yaml``, deduplicates nodes, and produces a
+    schema-validated NetworkX DiGraph.
+
     Performs Wilcoxon DE testing across Leiden clusters and uses the
-    results to create statistically-filtered edges (adj. p < 0.05,
-    |log2FC| > 0.5).
+    results to create statistically-filtered edges.
 
     When Stabl selects fewer than *min_genes*, the top-ranked genes by
     stability score are included to ensure the graph is informative.
 
-    Drug nodes from ChEMBL are added when *drug_df* is supplied.
-    Human ortholog symbols are stored as a ``human_ortholog`` attribute
-    on gene nodes when *ortho_map* is supplied.
+    Biological context (pathways, diseases, PPIs) is added when the
+    corresponding DataFrames are supplied.  Drug nodes from ChEMBL are
+    added when *drug_df* is supplied.
 
     Args:
         stabl_result: Dictionary from :func:`run_stabl_cached`.
         adata: AnnData with ``leiden`` clusters and raw expression.
         schema_path: Path to the BioCypher ``schema_config.yaml``.
+            Defaults to ``config/schema_config.yaml``.
         cluster_annotation: Dict mapping cluster id to region label
             (from :func:`annotate_clusters`).
         min_genes: Minimum number of gene nodes (default 20).
         drug_df: Optional DataFrame from
             :func:`~src.external_knowledge.get_drug_targets` containing
-            drug-target associations from ChEMBL.  When provided, Drug
-            nodes and ``drug_gene_association`` edges are added.
+            drug-target associations from ChEMBL.
         ortho_map: Optional dict mapping mouse gene symbol → human
-            ortholog symbol.  Stored as a ``human_ortholog`` attribute on
-            each gene node and used to resolve drug→gene edges.
+            ortholog symbol.
+        enrich_df: Optional DataFrame from
+            :func:`~src.external_knowledge.run_go_enrichment`.
+        disease_df: Optional DataFrame from
+            :func:`~src.external_knowledge.get_disease_associations`.
+        ppi_df: Optional DataFrame from
+            :func:`~src.external_knowledge.get_string_ppi`.
 
     Returns:
         A NetworkX directed graph with Gene, CellType, AnatomicalEntity,
-        and optionally Drug nodes plus DE-filtered association edges.
+        and optionally Pathway, Disease, and Drug nodes, plus
+        DE-filtered and biological-context association edges.
     """
+    schema_path = Path(schema_path) if schema_path else _DEFAULT_SCHEMA_PATH
+
     # Expand gene list if fewer than min_genes were selected
     expanded = _expand_gene_list(stabl_result, min_genes=min_genes)
     n_orig = expanded.get("n_selected_original", len(expanded["selected_genes"]))
@@ -552,64 +1012,159 @@ def build_micro_ckg(
     ]
     print(f"  DE results: {len(de_df)} tests, {len(sig)} significant")
 
-    print("  Building Micro-CKG...")
-    G = nx.DiGraph()
+    # -- Collect all nodes and edges from generators ------------------
+    nodes = _collect_nodes(
+        expanded, adata, cluster_annotation, drug_df, enrich_df, disease_df,
+    )
+    node_ids = {n[0] for n in nodes}
+    edges = _collect_edges(
+        expanded, adata, cluster_annotation, de_df,
+        drug_df, ortho_map, enrich_df, disease_df, ppi_df, node_ids,
+    )
 
-    # Add nodes
-    for node_id, node_label, props in generate_gene_nodes(expanded):
-        G.add_node(node_id, label=node_label, **props)
+    # -- Pipe through BioCypher for schema validation -----------------
+    print("  Validating against Biolink ontology via BioCypher...")
+    bc = BioCypher(
+        offline=False,
+        dbms="networkx",
+        schema_config_path=str(schema_path),
+        biocypher_config_path=str(_DEFAULT_BIOCYPHER_CONFIG_PATH),
+    )
+    # BioCypher 0.12.x initialises internal lists to None; workaround.
+    bc._nodes = []  # noqa: SLF001
+    bc._edges = []  # noqa: SLF001
 
-    for node_id, node_label, props in generate_cell_type_nodes(adata, cluster_annotation):
-        G.add_node(node_id, label=node_label, **props)
+    bc.add_nodes(nodes)
+    # BioCypher edge tuples: (optional_id, source, target, input_label, props)
+    bc.add_edges(edges)
 
-    for node_id, node_label, props in generate_anatomical_nodes(adata, cluster_annotation):
-        G.add_node(node_id, label=node_label, **props)
+    G: nx.DiGraph = bc.to_networkx()
 
-    # Add DE-filtered edges
-    for edge_id, src, tgt, label, props in generate_gene_cell_type_edges(
-        expanded, adata, cluster_annotation, de_df
-    ):
-        G.add_edge(src, tgt, key=edge_id, label=label, **props)
+    # -- Post-process for backward-compatible ``label`` attribute -----
+    il_map = _build_input_label_map(schema_path)
+    _postprocess_networkx(G, il_map)
 
-    for edge_id, src, tgt, label, props in generate_gene_region_edges(
-        expanded, adata, cluster_annotation, de_df
-    ):
-        G.add_edge(src, tgt, key=edge_id, label=label, **props)
+    # -- QC logging ---------------------------------------------------
+    bc.log_missing_input_labels()
+    bc.log_duplicates()
 
-    for edge_id, src, tgt, label, props in generate_cell_type_region_edges(
-        adata, cluster_annotation
-    ):
-        G.add_edge(src, tgt, key=edge_id, label=label, **props)
-
-    # Optionally add drug nodes and drug→gene edges
-    if drug_df is not None and not drug_df.empty:
-        for node_id, node_label, props in generate_drug_nodes(drug_df):
-            G.add_node(node_id, label=node_label, **props)
-        for edge_id, src, tgt, label, props in generate_drug_gene_edges(
-            drug_df, ortho_map
-        ):
-            # Only add the edge if the target gene node exists in the graph
-            if tgt in G:
-                G.add_edge(src, tgt, key=edge_id, label=label, **props)
-        drug_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "drug")
-        drug_edges = sum(
-            1 for _, _, d in G.edges(data=True) if d.get("label") == "drug_gene_association"
-        )
-        print(f"  Drug nodes added: {drug_nodes} compounds, {drug_edges} drug→gene edges")
-
+    # -- Summary print ------------------------------------------------
     n_nodes = G.number_of_nodes()
     n_edges = G.number_of_edges()
     gene_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "gene")
     ct_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "cell_type")
     region_nodes = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "anatomical_entity")
     drug_node_count = sum(1 for _, d in G.nodes(data=True) if d.get("label") == "drug")
+    pathway_node_count = sum(
+        1 for _, d in G.nodes(data=True) if d.get("label") == "biological_process"
+    )
+    disease_node_count = sum(
+        1 for _, d in G.nodes(data=True) if d.get("label") == "disease"
+    )
 
     node_breakdown = f"{gene_nodes} genes, {ct_nodes} cell types, {region_nodes} regions"
     if drug_node_count:
         node_breakdown += f", {drug_node_count} drugs"
+    if pathway_node_count:
+        node_breakdown += f", {pathway_node_count} pathways"
+    if disease_node_count:
+        node_breakdown += f", {disease_node_count} diseases"
     print(f"  Micro-CKG: {n_nodes} nodes ({node_breakdown})")
-    print(f"  Micro-CKG: {n_edges} edges (DE-filtered)")
+    print(f"  Micro-CKG: {n_edges} edges (DE-filtered, schema-validated)")
     return G
+
+
+def build_micro_ckg_agent(
+    stabl_result: dict[str, Any],
+    adata: ad.AnnData,
+    schema_path: Path | str | None = None,
+    cluster_annotation: dict[str, str] | None = None,
+    min_genes: int = _DEFAULT_MIN_GENES,
+    drug_df: pd.DataFrame | None = None,
+    ortho_map: dict[str, str] | None = None,
+    enrich_df: pd.DataFrame | None = None,
+    disease_df: pd.DataFrame | None = None,
+    ppi_df: pd.DataFrame | None = None,
+) -> BCGraph:
+    """Build a Micro-CKG using the BioCypher Agent ``Graph`` class.
+
+    Returns a pure-Python ``biocypher.Graph`` instance with built-in
+    type-aware indexing, ``find_paths``, ``get_subgraph``, and
+    ``to_json`` support — ideal for LLM agent integration and
+    interactive exploration.
+
+    The same node / edge generators used in :func:`build_micro_ckg` are
+    reused; the only difference is the output container.
+
+    Args:
+        stabl_result: Dictionary from :func:`run_stabl_cached`.
+        adata: AnnData with ``leiden`` clusters and raw expression.
+        schema_path: Path to the ``schema_config.yaml`` (used for
+            logging only in this pathway).
+        cluster_annotation: Dict mapping cluster id to region label.
+        min_genes: Minimum number of gene nodes (default 20).
+        drug_df: Optional drug-target DataFrame from ChEMBL.
+        ortho_map: Optional mouse → human gene symbol mapping.
+        enrich_df: Optional enrichment DataFrame.
+        disease_df: Optional disease-association DataFrame.
+        ppi_df: Optional STRING PPI DataFrame.
+
+    Returns:
+        A ``biocypher.Graph`` directed graph with type indexes,
+        path finding, subgraph extraction, and JSON serialisation.
+    """
+    # Expand gene list
+    expanded = _expand_gene_list(stabl_result, min_genes=min_genes)
+    n_orig = expanded.get("n_selected_original", len(expanded["selected_genes"]))
+    if len(expanded["selected_genes"]) > n_orig:
+        print(
+            f"  Expanded gene list: {n_orig} Stabl-selected → "
+            f"{len(expanded['selected_genes'])} genes (min_genes={min_genes})"
+        )
+    if ortho_map:
+        expanded = dict(expanded)
+        expanded["ortho_map"] = ortho_map
+
+    print("  Running DE testing (Wilcoxon rank-sum)...")
+    de_df = _run_de_analysis(adata, expanded["selected_genes"])
+    sig = de_df[
+        (de_df["pval_adj"] < _DE_PVAL_THRESHOLD)
+        & (de_df["log2fc"].abs() >= _DE_LOG2FC_THRESHOLD)
+    ]
+    print(f"  DE results: {len(de_df)} tests, {len(sig)} significant")
+
+    # Collect all nodes and edges
+    nodes = _collect_nodes(
+        expanded, adata, cluster_annotation, drug_df, enrich_df, disease_df,
+    )
+    node_ids = {n[0] for n in nodes}
+    edges = _collect_edges(
+        expanded, adata, cluster_annotation, de_df,
+        drug_df, ortho_map, enrich_df, disease_df, ppi_df, node_ids,
+    )
+
+    # Build BioCypher Agent Graph
+    print("  Building BioCypher Agent Graph...")
+    g = BCGraph("micro_ckg", directed=True)
+
+    for node_id, node_type, props in nodes:
+        g.add_node(node_id, node_type, props)
+
+    for edge_id, src, tgt, edge_type, props in edges:
+        eid = edge_id if edge_id else f"e:{src}_{tgt}_{edge_type}"
+        g.add_edge(eid, edge_type, src, tgt, props)
+
+    stats = g.get_statistics()
+    basic = stats["basic"]
+    print(
+        f"  Agent Graph: {basic['nodes']} nodes "
+        f"({dict(stats['node_types'])})"
+    )
+    print(
+        f"  Agent Graph: {basic['edges']} edges "
+        f"({dict(stats['edge_types'])})"
+    )
+    return g
 
 
 def save_graph(graph: nx.DiGraph, path: Path | str) -> Path:

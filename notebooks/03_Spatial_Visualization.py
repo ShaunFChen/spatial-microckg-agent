@@ -66,8 +66,7 @@ stabl_result = run_stabl_cached(
     dataset_name="geo_ad",
     label_method="condition",
     n_bootstraps=50,
-    prefilter="hvg",
-    n_hvgs=2000,
+    prefilter="de",
 )
 
 df_features = pd.DataFrame({

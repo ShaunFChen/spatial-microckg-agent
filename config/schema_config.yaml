@@ -6,8 +6,10 @@ gene:
     symbol: str
     stability_score: float
     is_selected: bool
+    human_ortholog: str
 
 cell type:
+  is_a: cell
   represented_as: node
   preferred_id: name
   input_label: cell_type
@@ -40,6 +42,7 @@ drug:
   input_label: drug
   properties:
     name: str
+    mechanism_of_action: str
     max_phase: int
 
 disease:
@@ -124,27 +127,41 @@ protein protein interaction:
 gene to biological process association:
   is_a: association
   represented_as: edge
-  input_label: gene_process_association
+  input_label: gene_participates_in_pathway
   source: gene
   target: biological process
   properties:
+    pval_adj: float
+    combined_score: float
     source_library: str
 
 gene to drug association:
   is_a: association
   represented_as: edge
-  input_label: drug_target_association
+  input_label: drug_gene_association
   source: drug
   target: gene
   properties:
     mechanism_of_action: str
     max_phase: int
+    human_target: str
 
 gene to disease association:
   is_a: association
   represented_as: edge
-  input_label: gene_disease_association
+  input_label: gene_associated_with_disease
   source: gene
   target: disease
   properties:
     disease_id: str
+
+gene to gene interaction:
+  is_a: pairwise molecular interaction
+  represented_as: edge
+  input_label: gene_interacts_with_gene
+  source: gene
+  target: gene
+  properties:
+    string_score: float
+    human_gene1: str
+    human_gene2: str

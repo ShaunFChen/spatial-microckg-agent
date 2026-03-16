@@ -13,7 +13,11 @@ for i, c in enumerate(nb.cells):
     print(f"  [{i+1}] {c.cell_type}: {len(c.source)} chars")
 
 ep = ExecutePreprocessor(timeout=600, kernel_name="python3", allow_errors=True)
-ep.preprocess(nb, {"metadata": {"path": str(Path(nb_path).parent)}})
+try:
+    ep.preprocess(nb, {"metadata": {"path": str(Path(nb_path).resolve().parent)}})
+except Exception as e:
+    print(f"\n⚠ Execution interrupted: {type(e).__name__}: {e}")
+    print("  Continuing with partial results...")
 
 with open(nb_path, "w") as f:
     nbformat.write(nb, f)

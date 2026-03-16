@@ -29,6 +29,7 @@ dependencies = [
     "mygene",
     "gseapy",
     "chembl-webresource-client",
+    "pyvis>=0.3.2",
 ]
 
 [dependency-groups]

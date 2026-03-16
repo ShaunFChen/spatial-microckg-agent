@@ -11,4 +11,6 @@ __all__ = [
     "external_knowledge",
     "graph_analytics",
     "spatial_gat",
+    "nanostring_pipeline",
+    "xenium_pipeline",
 ]

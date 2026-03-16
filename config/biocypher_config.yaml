@@ -1,0 +1,10 @@
+# BioCypher configuration for Spatial-MicroCKG
+# See https://biocypher.org/BioCypher/reference/biocypher-config/
+
+biocypher:
+  # Build an in-memory NetworkX DiGraph (no database server required)
+  dbms: networkx
+  offline: false
+
+  # Strict mode: raise on schema mismatches instead of warning
+  strict_mode: false

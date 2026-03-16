@@ -192,32 +192,56 @@ print(f"  Max: {df_features['Stability Score'].max():.4f}")
 print(f"  Genes with score = 1.0: {(df_features['Stability Score'] == 1.0).sum()}")
 
 # %% [markdown]
-# ## 2.5 Volcano Plot — Stabl Overlay
+# ## 2.5 Volcano Plot — Stabl Overlay (Wilcoxon Full Background)
 #
-# Same genome-wide DE background as §2.2, now with **Stabl-selected biomarkers** highlighted. Stabl genes are overlaid in gold with name annotations. The bottom corners show the Stabl gene count alongside the DE significance counts, demonstrating that Stabl does not simply recapitulate the top fold-change genes — it selects for **reproducibility across bootstrap iterations**.
+# A fresh **Wilcoxon rank-sum test** is computed on the *entire* ~22 k-gene dataset (`n_genes=None`) to provide an unbiased background population. All genes are rendered as **grey dots**, and only the Stabl-certified biomarkers are overlaid in **red**. This separates Stabl's reproducibility-based selection from any direction-of-change bias in the earlier t-test.
 
 # %%
-# Mark Stabl genes in the genome-wide DE table
-de_df["is_stabl"] = de_df["gene"].isin(set(stabl_result["selected_genes"]))
-n_stabl = de_df["is_stabl"].sum()
+# Compute Wilcoxon rank-sum DE on the ENTIRE dataset (n_genes=None → rank all genes)
+sc.tl.rank_genes_groups(
+    adata,
+    groupby="condition_label",
+    groups=["PSAPP (AD)"],
+    reference="WT",
+    method="wilcoxon",
+    n_genes=None,
+    key_added="wilcoxon_full",
+)
+de_wilcox = sc.get.rank_genes_groups_df(adata, group="PSAPP (AD)", key="wilcoxon_full")
+de_wilcox = de_wilcox.rename(
+    columns={"names": "gene", "logfoldchanges": "log2FC", "pvals_adj": "pval_adj"}
+)
+de_wilcox["pval_adj"] = de_wilcox["pval_adj"].clip(lower=1e-300)
+de_wilcox["neg_log10_pval"] = -np.log10(de_wilcox["pval_adj"])
+de_wilcox["is_stabl"] = de_wilcox["gene"].isin(set(stabl_result["selected_genes"]))
 
-# ---------- Volcano Plot 2: DE + Stabl overlay ----------
+# Free memory
+del adata.uns["wilcoxon_full"]
+import gc; gc.collect()
+
+n_stabl = int(de_wilcox["is_stabl"].sum())
+n_bg = len(de_wilcox) - n_stabl
+print(f"Wilcoxon DE: {len(de_wilcox):,} total genes | {n_stabl} Stabl-selected")
+
+# ---------- Volcano Plot 2: Full Wilcoxon background + Stabl overlay ----------
 fig, ax = plt.subplots(figsize=(10, 7))
 fig.patch.set_facecolor("white")
 
-# Background: DE-coloured genes (same as §2.2)
-for cat, zorder in [("ns", 1), ("down", 3), ("up", 3)]:
-    sub = de_df[(de_df["sig"] == cat) & ~de_df["is_stabl"]]
-    sz = 8 if cat == "ns" else 30
-    alpha = 0.25 if cat == "ns" else 0.5
-    ax.scatter(sub["log2FC"], sub["neg_log10_pval"],
-               s=sz, alpha=alpha, c=COLOR_MAP[cat], linewidths=0, zorder=zorder)
+# Background: ALL genes as grey dots
+bg = de_wilcox[~de_wilcox["is_stabl"]]
+ax.scatter(
+    bg["log2FC"], bg["neg_log10_pval"],
+    s=6, alpha=0.2, c="#CCCCCC", linewidths=0, zorder=1,
+)
 
-# Foreground: Stabl-selected genes
-fg = de_df[de_df["is_stabl"]]
-ax.scatter(fg["log2FC"], fg["neg_log10_pval"], s=80, alpha=0.95, c="#FF8C00",
-           linewidths=0.8, edgecolors="black", zorder=10,
-           label=f"Stabl-selected (n={n_stabl})")
+# Foreground: Stabl-selected genes overlaid in red
+fg = de_wilcox[de_wilcox["is_stabl"]]
+ax.scatter(
+    fg["log2FC"], fg["neg_log10_pval"],
+    s=80, alpha=0.95, c="#D62728",
+    linewidths=0.8, edgecolors="black", zorder=10,
+    label=f"Stabl-selected (n={n_stabl})",
+)
 
 # Annotate Stabl gene names
 for _, row in fg.iterrows():
@@ -229,21 +253,21 @@ for _, row in fg.iterrows():
     )
 
 # Reference lines
-ax.axhline(pval_line, color="#888", ls="--", lw=0.8, zorder=0)
+ax.axhline(-np.log10(FDR_THR), color="#888", ls="--", lw=0.8, zorder=0)
 ax.axvline(FC_THR, color="#888", ls=":", lw=0.7, zorder=0)
 ax.axvline(-FC_THR, color="#888", ls=":", lw=0.7, zorder=0)
 
-# Counts in bottom corners
-ax.text(0.02, 0.03, f"Down: {n_down:,}", transform=ax.transAxes,
-        fontsize=11, fontweight="bold", color="#D62728", va="bottom")
-ax.text(0.98, 0.03, f"Up: {n_up:,}", transform=ax.transAxes,
-        fontsize=11, fontweight="bold", color="#1F77B4", va="bottom", ha="right")
+ax.text(0.02, 0.03, f"Background: {n_bg:,}", transform=ax.transAxes,
+        fontsize=10, color="#999999", va="bottom")
 ax.text(0.50, 0.03, f"Stabl: {n_stabl}", transform=ax.transAxes,
-        fontsize=11, fontweight="bold", color="#FF8C00", va="bottom", ha="center")
+        fontsize=11, fontweight="bold", color="#D62728", va="bottom", ha="center")
 
 ax.set_xlabel("log2 Fold Change (PSAPP vs. WT)", fontsize=12)
 ax.set_ylabel("−log10 (Adjusted p-value)", fontsize=12)
-ax.set_title("Genome-Wide DE + Stabl-Selected Biomarkers", fontsize=13, pad=10)
+ax.set_title(
+    "Wilcoxon Full-Background Volcano + Stabl-Selected Biomarkers",
+    fontsize=13, pad=10,
+)
 ax.legend(frameon=False, fontsize=10, loc="upper right")
 ax.spines[["top", "right"]].set_visible(False)
 
@@ -257,12 +281,49 @@ print(f"Volcano plot saved → {vol2_path}")
 # %% [markdown]
 # ## 2.6 Biological Interpretation & Disease-Agnostic Validation
 #
-# The Stabl-certified genes were selected without any prior bias toward classical neuroinflammation markers. Notably, canonical AD inflammatory genes such as *Trem2* and *Gfap* were **not** selected — they are variable but not consistently predictive of condition across bootstraps. Instead, the algorithm converged on primary upstream molecular effectors of Alzheimer's pathology:
+# The Stabl-certified genes were selected without any prior bias toward
+# classical neuroinflammation markers. Notably, canonical AD inflammatory
+# genes such as *Trem2* and *Gfap* were **not** selected — they are
+# variable but not consistently predictive of condition across bootstraps.
+# Instead, the algorithm converged on genes spanning three
+# AD-relevant biological themes:
 #
-# **Amyloid-beta synaptic toxicity.** *Prnp* (Prion Protein), the top-ranked gene (stability = 1.0), encodes the primary high-affinity receptor for amyloid-beta oligomers on the neuronal surface. Its consistent selection reflects the central role of Aβ–PrPc binding in mediating synaptic toxicity and downstream tau hyperphosphorylation in the PSAPP model.
+# **Amyloid-β synaptic toxicity.** *Prnp* (Prion Protein,
+# stability = 1.0) encodes the primary high-affinity receptor for
+# amyloid-β oligomers on the neuronal surface. *Ngfr* (p75^NTR,
+# stability = 1.0) mediates Aβ-induced neuronal apoptosis. Together
+# with two synaptic vesicle genes — *Syt2* (Synaptotagmin 2) and
+# *Sv2c* (SV2C) — these markers capture the core Aβ–synapse toxicity
+# axis of the PSAPP model.
 #
-# **Iron dyshomeostasis and oxidative stress.** *Fth1* (Ferritin Heavy Chain 1) and *Trf* (Transferrin) capture the well-documented iron accumulation that co-localizes with amyloid plaques. Iron catalyzes Fenton-reaction-driven oxidative damage, and the Stabl selection of both the storage (*Fth1*) and transport (*Trf*) arms indicates a **coordinated dysregulation of iron homeostasis** rather than a localized inflammatory response.
+# **Monoaminergic & neuropeptide circuits.** *Th* (Tyrosine
+# Hydroxylase, stability = 0.96) marks dopaminergic and noradrenergic
+# neurons whose degeneration in the locus coeruleus is among the
+# earliest events in AD. *Oxt* (Oxytocin) and *Pmch*
+# (Melanin-Concentrating Hormone) implicate hypothalamic
+# neuropeptide circuits increasingly linked to AD-associated
+# behavioural and metabolic dysregulation.
 #
-# **Hippocampal neurodegeneration.** *Calb1* (Calbindin) is a calcium-buffering protein enriched in the Hippocampal Dentate Gyrus. Its selection reflects calcium dyshomeostasis and the selective vulnerability of hippocampal neurons in AD — **consistent with the established neuropathology** of the PSAPP model, where amyloid deposition predominantly affects limbic structures.
+# **Neurodegeneration & stress-response signalling.** *Cdc42ep1*
+# carries a direct Alzheimer's disease association in OpenTargets.
+# *Foxo4* mediates oxidative-stress-induced senescence, *Rbm3* is a
+# cold-shock neuroprotective factor, and *Cyp27a1* catalyses
+# cholesterol 27-hydroxylation — linking to oxysterol/PPAR pathways
+# implicated in neuroinflammatory lipid metabolism.
 #
-# **Conclusion.** The pipeline's unbiased discovery of synaptic toxicity mediators (*Prnp*), metal dyshomeostasis markers (*Fth1*, *Trf*), and region-specific neurodegeneration signatures (*Calb1*) — rather than generic inflammatory genes — **demonstrates the pipeline's capacity** to extract **core molecular mechanisms**. This disease-agnostic approach generalizes beyond AD to any spatial transcriptomics dataset with condition labels.
+# **What was *not* selected.** Literature-motivated AD genes such as
+# *Fth1* (ferritin), *Trf* (transferrin), and *Calb1* (calbindin)
+# did not pass the DE pre-filter, indicating they are not
+# differentially expressed between PSAPP and WT in this dataset.
+# Their absence underscores the value of unbiased selection: the
+# pipeline surfaces **data-driven** markers rather than confirming
+# prior expectations.
+#
+# **Conclusion.** The pipeline's unbiased discovery of Aβ-receptor
+# and synaptic-vesicle genes (*Prnp*, *Ngfr*, *Syt2*),
+# monoaminergic neurodegeneration markers (*Th*), and direct AD-
+# associated signalling hubs (*Cdc42ep1*, *Foxo4*) — rather than
+# generic inflammatory genes — demonstrates its capacity to extract
+# **core molecular mechanisms**. This disease-agnostic approach
+# generalises beyond AD to any spatial transcriptomics dataset with
+# condition labels.
